@@ -1,0 +1,22 @@
+{
+  "name": "@kb/eslint-config",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "license": "UNLICENSED",
+  "main": "./base.js",
+  "exports": {
+    ".": "./base.js",
+    "./next": "./next.js",
+    "./nest": "./nest.js"
+  },
+  "dependencies": {
+    "@eslint/js": "10.0.1",
+    "eslint-config-prettier": "10.1.8",
+    "globals": "17.12.0",
+    "typescript-eslint": "8.70.0"
+  },
+  "peerDependencies": {
+    "eslint": "^10.0.0"
+  }
+}

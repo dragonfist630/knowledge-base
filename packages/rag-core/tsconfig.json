@@ -1,0 +1,12 @@
+{
+  "extends": "@kb/tsconfig/library.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "tsBuildInfoFile": "./dist/.tsbuildinfo",
+    "outDir": "./dist",
+    "rootDir": "./src"
+  },
+  "include": [
+    "src"
+  ]
+}

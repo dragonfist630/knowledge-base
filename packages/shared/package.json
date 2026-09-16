@@ -1,0 +1,33 @@
+{
+  "name": "@kb/shared",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "license": "UNLICENSED",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint . --max-warnings 0",
+    "test": "echo \"no tests yet (Phase 3+)\" && exit 0",
+    "clean": "rm -rf dist .turbo"
+  },
+  "devDependencies": {
+    "@kb/eslint-config": "workspace:*",
+    "@kb/tsconfig": "workspace:*",
+    "eslint": "10.10.0",
+    "tsup": "8.5.1",
+    "typescript": "5.9.3"
+  },
+  "dependencies": {
+    "zod": "4.6.5"
+  }
+}

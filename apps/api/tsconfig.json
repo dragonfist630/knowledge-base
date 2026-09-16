@@ -1,0 +1,15 @@
+{
+  "extends": "@kb/tsconfig/nestjs.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "outDir": "./dist",
+    "rootDir": ".",
+    "removeComments": true,
+    "resolvePackageJsonExports": true,
+    "allowSyntheticDefaultImports": true,
+    "incremental": true,
+    "types": ["vitest/globals", "node"]
+  },
+  "include": ["src", "test"],
+  "exclude": ["node_modules", "dist"]
+}

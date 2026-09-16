@@ -1,0 +1,52 @@
+{
+  "name": "api",
+  "version": "0.0.1",
+  "description": "AI-Powered Knowledge Base — NestJS API",
+  "author": "",
+  "private": true,
+  "license": "UNLICENSED",
+  "type": "module",
+  "scripts": {
+    "build": "nest build",
+    "dev": "nest start --watch",
+    "start": "nest start",
+    "start:dev": "nest start --watch",
+    "start:debug": "nest start --debug --watch",
+    "start:prod": "node dist/main",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "eslint . --max-warnings 0",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:cov": "vitest run --coverage",
+    "test:debug": "vitest --inspect-brk --no-file-parallelism",
+    "test:e2e": "vitest run --config ./vitest.config.e2e.ts",
+    "clean": "rm -rf dist .turbo"
+  },
+  "dependencies": {
+    "@kb/shared": "workspace:*",
+    "@nestjs/common": "12.0.3",
+    "@nestjs/core": "12.0.3",
+    "@nestjs/platform-express": "12.0.3",
+    "dotenv": "17.4.2",
+    "reflect-metadata": "0.2.2",
+    "rxjs": "7.8.2"
+  },
+  "devDependencies": {
+    "@kb/eslint-config": "workspace:*",
+    "@kb/tsconfig": "workspace:*",
+    "@nestjs/cli": "12.0.1",
+    "@nestjs/schematics": "12.0.1",
+    "@nestjs/testing": "12.0.3",
+    "@types/express": "5.0.5",
+    "@types/node": "22.20.3",
+    "@types/supertest": "6.0.3",
+    "@vitest/coverage-v8": "4.1.2",
+    "eslint": "10.10.0",
+    "prettier": "3.6.2",
+    "source-map-support": "0.5.21",
+    "supertest": "7.1.4",
+    "typescript": "5.9.3",
+    "vite-tsconfig-paths": "5.1.4",
+    "vitest": "4.1.2"
+  }
+}
