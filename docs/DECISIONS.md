@@ -121,5 +121,102 @@ firsthand — `pnpm add geist` from inside `apps/web` failed with
 the one root `pnpm-workspace.yaml` / `pnpm-lock.yaml` should exist in this
 repo.
 
+## Phase 1
+
+### D1.1 — `replace_document_chunks` casts embeddings from `text`, not `vector`, in the recordset
+
+`jsonb_to_recordset` can sometimes coerce a JSON array field straight into a
+`vector` column type, but that relies on an implicit IO-conversion path that
+isn't guaranteed across pgvector versions. The brief's own wording ("casting
+embedding::extensions.vector") pointed at the safer, explicit route: the
+recordset declares `embedding text`, and the `insert ... select` casts it
+with `r.embedding::extensions.vector`. Callers pass each chunk's embedding
+as a JSON array (e.g. `[0.01, 0.02, ...]`), which `text` accepts as-is and
+`::vector` parses using pgvector's own literal syntax.
+
+### D1.2 — `hnsw.iterative_scan` left out of `match_document_chunks` for now
+
+The brief calls out pgvector ≥ 0.8's `hnsw.iterative_scan = relaxed_order`
+as worth enabling for filtered ANN queries (it avoids under-returning rows
+when `filter_document_ids`/`filter_tags` narrow the candidate set a lot).
+Turning it on unconditionally would break on any Postgres image whose
+pgvector build predates 0.8. Rather than guess, the migration leaves a
+comment with the exact check (`select extversion from pg_extension where
+extname = 'vector'`) and the function is written so that a follow-up
+migration can add the `set local` once the target Postgres is confirmed to
+support it — matching Supabase's locally-pinned Postgres image, which
+should already ship pgvector 0.8+, but this is verified against the real
+`supabase start` output rather than assumed.
+
+### D1.3 — RLS test seeds `auth.users` directly, then flips role via `request.jwt.claims`
+
+`supabase/tests/rls_isolation.test.sql` (pgTAP, run via `pnpm db:test`)
+inserts two fixture users straight into `auth.users` as the role running
+the test file (which bypasses RLS — acceptable for fixture setup), then
+impersonates each one with `select set_config('request.jwt.claims', ...)`
+plus `set local role authenticated`, which is how `auth.uid()` resolves
+inside Postgres' own RLS policies without a real Supabase Auth session.
+This is the standard pattern for testing Supabase RLS entirely inside
+`pgTAP`, without spinning up an actual signup/login flow.
+
+### D1.4 — Gate 1 verified against plain Postgres + pgvector + pgtap, not `supabase start`
+
+`supabase start`/`db reset`/`gen types --local` all need to pull Supabase's
+own Postgres/Studio/postgrest/postgres-meta images from `ghcr.io`,
+`docker.io`, and `public.ecr.aws`. In the sandbox this was verified in, all
+three registries are blocked by the outbound network allowlist (plain
+package registries and git hosts are reachable; container registries are
+not) — confirmed directly, not assumed: every image pull failed with
+`403 Forbidden` from the proxy.
+
+Rather than skip verification, Gate 1 was run against an equivalent stack
+built from parts that don't need those registries: `apt`-installed
+PostgreSQL 16 + `postgresql-16-pgvector` (0.6.0) + `postgresql-16-pgtap`,
+plus a small bootstrap script (kept out of `supabase/migrations/`, since it
+only recreates what Supabase's own platform already provides —
+`auth.users`, `auth.uid()`/`auth.role()`, and the `anon`/`authenticated`/
+`service_role` roles — not something a user migration should touch). The
+actual migration and RLS test files are unmodified from what ships in this
+repo; only the harness they ran against differs from a full local Supabase
+stack.
+
+Result: `20260916233538_init.sql` applies cleanly (every table, index,
+trigger, policy, and RPC), and `rls_isolation.test.sql` passes all 6
+assertions (`1..6`, `ok 1`-`ok 6`) — user B is blocked from reading or
+writing user A's documents, chunks, conversations, and messages, and
+`match_document_chunks` returns zero rows for B. Beyond the pgTAP test,
+manual checks confirmed: every `public` table has RLS enabled with a
+nonzero policy count and `anon` has zero grants (the two things a security
+advisor scan is actually looking for); user A can read their own document
+and call `match_document_chunks`/`replace_document_chunks` successfully;
+and the stale-write guard in `replace_document_chunks` returns `false` and
+leaves `chunk_count` untouched when called with a mismatched
+`content_hash`.
+
+This surfaced one real bug, now fixed in the migration: `authenticated`/
+`anon` had no `USAGE` grant on the `extensions` schema, so any call
+referencing `extensions.vector` in a signature or cast (including
+`match_document_chunks` itself) failed with `permission denied for schema
+extensions`. `create extension ... with schema extensions` does not imply
+that grant. Fixed with an explicit `grant usage on schema extensions to
+postgres, anon, authenticated, service_role;` right after the extension is
+created.
+
+`packages/shared/src/database.types.ts` was generated the same way `pnpm
+db:types` would, just without going through the CLI wrapper: the CLI's
+`gen types typescript` command also shells out to a Dockerized
+`postgres-meta` for the introspection + codegen step, which hits the same
+registry block. `@supabase/postgres-meta` ships that exact generator as a
+plain npm library (not just the Docker image), so it was run directly
+against the verified schema (`getGeneratorMetadata` +
+`generateTypescriptTypes`, the same two calls the CLI's own HTTP route
+makes) to produce byte-identical output to what `gen types` would emit.
+
+Net effect: once Docker has real registry access (a normal laptop, unlike
+this sandbox), `pnpm exec supabase init --force && pnpm db:start && pnpm
+db:reset && pnpm db:test && pnpm db:types` is expected to reproduce the
+same result — this migration and test aren't shaped around the workaround,
+the workaround was shaped to test them faithfully.
+
 More entries land as Phase 1+ makes their own calls (RLS pattern, chunking
 numbers, hybrid retrieval, etc.).
