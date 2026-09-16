@@ -109,5 +109,17 @@ command — full build not required) before `tsc --noEmit`, so `pnpm
 lint && pnpm typecheck && pnpm build` all pass in that order on a clean
 checkout, independent of each other.
 
+### D0.9 — Removed `apps/web`'s own `pnpm-workspace.yaml`/`pnpm-lock.yaml`
+
+`create-next-app --use-pnpm` runs its own `pnpm install` inside
+`apps/web` before it's wired into the root workspace, which leaves a
+second, nested `pnpm-workspace.yaml` + `pnpm-lock.yaml` behind. That's not
+inert: pnpm commands run from inside `apps/web` treat it as its own
+workspace root, so `@kb/*` workspace dependencies "disappear" (we hit this
+firsthand — `pnpm add geist` from inside `apps/web` failed with
+`@kb/tsconfig ... not present in the workspace`). Deleted both files; only
+the one root `pnpm-workspace.yaml` / `pnpm-lock.yaml` should exist in this
+repo.
+
 More entries land as Phase 1+ makes their own calls (RLS pattern, chunking
 numbers, hybrid retrieval, etc.).
