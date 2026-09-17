@@ -1,0 +1,51 @@
+# Local Supabase config for `supabase start` — see docs/DECISIONS.md Phase 3
+# (D3.1) for why the RLS/pgTAP verification in this repo (Phase 1) and the
+# Gate 3 e2e tests (Phase 3) were actually run against a lighter substitute
+# in this sandbox instead of this file (`supabase start` needs Docker, which
+# this environment doesn't have) — this file is what a reviewer with Docker
+# installed actually runs, and it's kept in sync with what that substitute
+# assumes about local auth (see below).
+
+project_id = "knowledge-base"
+
+[api]
+enabled = true
+port = 54321
+schemas = ["public", "graphql_public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[db]
+port = 54322
+major_version = 16
+
+[studio]
+enabled = true
+port = 54323
+
+[auth]
+enabled = true
+site_url = "http://localhost:3000"
+additional_redirect_urls = ["http://localhost:3000"]
+jwt_expiry = 3600
+enable_signup = true
+
+[auth.email]
+enable_signup = true
+double_confirm_changes = false
+# Local/demo only — production turns this on (see the root README). Off
+# here so `scripts/seed.mjs` and the e2e tests can sign up and immediately
+# use a session without a real inbox to click through.
+enable_confirmations = false
+
+[storage]
+enabled = false
+
+# Note on the JWT secret: the CLI doesn't expose a `jwt_secret` config.toml
+# key (it's fixed, not something a project config chooses) — every
+# `supabase start` stack signs and verifies auth JWTs with the same
+# well-known local-dev value,
+# `super-secret-jwt-token-with-at-least-32-characters-long`. Set
+# SUPABASE_JWT_SECRET to that value in .env for local dev; see
+# apps/api/src/auth/auth.guard.ts and docs/DECISIONS.md Phase 3 (D3.1) for
+# what it's used for.

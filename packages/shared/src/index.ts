@@ -12,7 +12,29 @@
  *   - Phase 5: `chat-events.ts` (the ChatEvent discriminated union)
  */
 
-export const KB_SHARED_VERSION = "0.0.0-phase0";
+export const KB_SHARED_VERSION = "0.3.0-phase3";
 
 export type { Database, Json, Tables, TablesInsert, TablesUpdate, Enums, CompositeTypes } from "./database.types.js";
 export { Constants } from "./database.types.js";
+
+export {
+  DocumentCreateSchema,
+  DocumentUpdateSchema,
+  DocumentListQuerySchema,
+  DocumentSummarySchema,
+  DocumentDetailSchema,
+  DocumentListResponseSchema,
+  IndexStatusSchema,
+} from "./documents.js";
+export type {
+  DocumentCreate,
+  DocumentUpdate,
+  DocumentListQuery,
+  DocumentSummary,
+  DocumentDetail,
+  DocumentListResponse,
+  IndexStatus,
+} from "./documents.js";
+
+export { ApiErrorResponseSchema } from "./errors.js";
+export type { ApiErrorResponse, ApiFieldError } from "./errors.js";

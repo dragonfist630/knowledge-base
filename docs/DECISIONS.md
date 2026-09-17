@@ -554,3 +554,143 @@ install, lint, typecheck, build, `pnpm test`, `pnpm ai:check`): 81/81
 tests pass (79 + the 2 new retry regression tests), Gate 2's grep check
 still confined to `packages/ai/src/openai-compatible/**`, and no secrets,
 `.env` files, or other committed credentials found in a repo-wide scan.
+
+## Phase 3
+
+### D3.1 — Gate 3 e2e harness: real PostgREST + hand-minted JWTs, not `supabase start`
+
+The dev Mac this project is built on has no Docker or Podman (`supabase
+start` fails outright, naming both), so there's no local GoTrue and no way
+to test "through the auth API" the way the brief describes literally.
+
+Rather than fake this with a bare pgTAP-style role switch (the Phase 1 Gate
+1 approach — see D1.4 — which never goes over HTTP or through a real JWT),
+`apps/api/test/e2e/global-setup.ts` builds a genuine, if partial, substitute:
+a real PostgREST v12.2.3 static binary (auto-downloaded per-platform by
+`apps/api/test/e2e/postgrest-binary.ts` into `.cache/postgrest/`, gitignored)
+pointed at an ephemeral `kb_e2e_test` database, a small dependency-free
+reverse proxy (`rest-proxy.ts`) that strips supabase-js's fixed
+`/rest/v1` path prefix, and hand-minted HS256 JWTs (`jwt.ts`) signed with
+the exact well-known secret every bare `supabase start` uses locally
+(`super-secret-jwt-token-with-at-least-32-characters-long` — see
+`supabase/config.toml`'s closing note). Two real `auth.users` rows are
+seeded per run for the CRUD/isolation scenarios.
+
+This is not a weaker test of `AuthGuard` than a real Supabase project would
+get: `AuthGuard.verify()` always tries `getClaims()` first (the only path
+that ever runs against a real hosted or `supabase start`-with-custom-JWKS
+project) and falls back to local HS256 verification only when that throws
+— which is also exactly what happens against a bare local `supabase start`,
+since it signs with the same shared secret and has no JWKS endpoint either.
+Nothing test-only is baked into `AuthGuard` itself; only the *harness*
+(PostgREST + minted JWTs instead of a full GoTrue) stands in for
+`supabase start`, and it's meant to be swappable for a real Dockerized
+stack by anyone who has Docker (point `E2E_POSTGRES_SUPERUSER_URL` at it
+and everything else still applies unmodified).
+
+Real limitations, stated plainly rather than hidden: this needs a genuine
+local Postgres reachable as a superuser (`E2E_POSTGRES_SUPERUSER_URL`,
+default `postgres://postgres:postgres@127.0.0.1:5432/postgres`) — the
+harness does not attempt to start Postgres itself, since "start Postgres"
+is too platform-specific to do reliably from Node (Postgres.app vs.
+Homebrew services vs. a system service differ by OS). And PostgREST
+v12.2.3 ships no native darwin-arm64 build; on Apple Silicon the harness
+falls back to the x64 build under Rosetta 2 (present on most dev machines
+already) unless `brew install postgrest` (or an equivalent) puts a native
+binary on `PATH` or at `POSTGREST_BIN` first. Both are documented in
+`postgrest-binary.ts`'s own comments and surfaced as clear, actionable
+errors rather than a silent hang if either prerequisite is missing.
+
+### D3.2 — `IndexingQueue` is a Phase 3 stub; real processing lands in Phase 4
+
+`documents.service.ts` enqueues an `{ documentId, contentHash, userJwt }`
+job into `IndexingQueue` on every create, hash-changing update, and
+successful reindex request — but `IndexingQueue` itself
+(`apps/api/src/indexing/indexing.queue.ts`) is currently just an in-memory
+`Map`, with no consumer. This is a deliberate phase boundary, not an
+oversight: the real pipeline (chunk → embed → `replace_document_chunks`)
+needs `packages/rag-core`'s chunker, which doesn't exist yet — it's Phase
+4's job. Until then, every document sits in `index_status = 'pending'`
+(set by `documents.service.ts` itself, not by a consumer) and stays there;
+nothing in `IndexingQueue` contacts an AI provider or the database. The
+class exposes a `peek()` method explicitly marked "test/inspection hook
+only" — the real Phase 4 queue won't need it — which is what
+`documents.e2e-spec.ts` uses to verify the hash-gating behavior (a
+tags-only update doesn't enqueue a new job; a content/title change does)
+without `IndexingQueue` having any HTTP-visible side effect yet to assert
+on directly.
+
+### D3.3 — `@typescript-eslint/consistent-type-imports`'s `--fix` silently broke NestJS DI
+
+Caught by actually running the Gate 3 e2e suite for the first time (not by
+lint or typecheck, which both stayed green throughout): `AuthGuard`,
+`DocumentsController`, and `DocumentsService` all failed to boot with
+`Nest can't resolve dependencies` errors for `Reflector`, `DocumentsService`,
+`IndexingQueue`, and `DocumentsRepository` respectively.
+
+Root cause: running `eslint --fix` earlier (to clear a batch of
+`consistent-type-imports` warnings) rewrote each of those constructor
+parameter's imports to `import type { X } from "..."`. ESLint's static
+analysis sees a constructor parameter's type annotation as a pure type
+position and "helpfully" strips the value import — but NestJS's DI
+resolves a constructor-injected dependency from the `design:paramtypes`
+array TypeScript's `emitDecoratorMetadata` emits, which only contains a
+real class reference when the import is a genuine value import. A
+type-only import is erased entirely at compile time, so the emitted
+metadata slot for that parameter is empty, and Nest has no way to resolve
+it — a failure mode invisible to both `tsc --noEmit` (types are still
+correct) and `eslint` itself (the rule doesn't know about
+`emitDecoratorMetadata`), and only surfaces at runtime, when the app
+actually tries to boot and inject.
+
+Fixed by reverting all four imports to real value imports and adding an
+explicit `// eslint-disable-next-line @typescript-eslint/consistent-type-imports`
+with a comment explaining why, at each site. No attempt was made to write
+a custom lint rule to catch this class of bug generally (out of scope for
+Phase 3) — the practical mitigation going forward is: after any
+`eslint --fix` run that touches a file with constructor-injected
+dependencies, actually boot the app (an e2e test, not just `pnpm build`)
+before trusting the fix.
+
+### D3.4 — Zod v4: `.optional()` doesn't short-circuit a `.default()`-bearing schema on `undefined`
+
+Also caught by the Gate 3 e2e suite itself, not by any unit test written
+in advance: `documents.e2e-spec.ts`'s empty-patch case (`PATCH` with body
+`{}`, expecting 400) got a 200 instead. `DocumentUpdateSchema`'s `tags`
+field reused the exact same schema instance as `DocumentCreateSchema`'s
+`tags`, which has `.default([])` baked in, wrapped in an extra
+`.optional()` for the update schema. The expectation was that
+`.optional()` on `undefined` input would short-circuit before the inner
+`.default()` ever ran, leaving `tags` genuinely `undefined` in the parsed
+output — so the schema's `.refine()` (requiring at least one of
+`title`/`content`/`tags` to be present) would correctly reject a body with
+none of them. Instead, zod v4's `.optional()` still delegates to the inner
+schema on `undefined` input, so the `.default([])` fired anyway, `tags`
+came back as `[]` (not `undefined`), and `.refine()`'s condition was
+satisfied by a field the client never sent.
+
+Fixed in `packages/shared/src/documents.ts` by splitting the tags schema:
+`tagsWithoutDefault` (no default, used by `DocumentUpdateSchema.tags`,
+wrapped in `.optional()` there) and only applying `.default([])` directly
+on `DocumentCreateSchema.tags` (not further wrapped in `.optional()`,
+where the default reliably fires as intended). Added
+`packages/shared/src/documents.spec.ts` with a regression test that calls
+`DocumentUpdateSchema.parse({})` directly and asserts it throws — this
+would have caught the bug at the unit level, well before an e2e run, had
+it existed first; it's now the second line of defense alongside Gate 3's
+actual empty-patch HTTP test.
+
+### D3.5 — Full verification: fresh state, every gate green
+
+After D3.3 and D3.4's fixes, re-ran the complete pipeline from the current
+working tree (not yet a fresh clone — that re-validation pass happens
+after the push, following the same D1.5/D2.6 pattern): `pnpm lint`,
+`pnpm typecheck`, `pnpm build`, `pnpm test` across every workspace
+(`@kb/ai` 81/81, `@kb/shared` 7/7 including the new regression test,
+`apps/api` 6/6 unit), `apps/api`'s `pnpm test:e2e` (8/8 — full CRUD
+lifecycle, cross-user RLS isolation returning 404 not 403, malformed-id
+400, empty-body 400 with field errors, tags-only vs. content-changing
+update against the real `IndexingQueue`), and `pnpm ai:check` (mock
+provider, both chat and embedding). Confirmed the e2e harness tears down
+cleanly (no orphaned PostgREST/proxy processes, `kb_e2e_test` dropped)
+after both a passing and (during D3.3/D3.4 debugging) a failing run.

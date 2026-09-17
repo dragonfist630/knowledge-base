@@ -17,7 +17,8 @@
     "dev": "tsup --watch",
     "typecheck": "tsc --noEmit",
     "lint": "eslint . --max-warnings 0",
-    "test": "echo \"no tests yet (Phase 3+)\" && exit 0",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "clean": "rm -rf dist .turbo"
   },
   "devDependencies": {
@@ -25,7 +26,9 @@
     "@kb/tsconfig": "workspace:*",
     "eslint": "10.10.0",
     "tsup": "8.5.1",
-    "typescript": "5.9.3"
+    "typescript": "5.9.3",
+    "vite-tsconfig-paths": "5.1.4",
+    "vitest": "4.1.2"
   },
   "dependencies": {
     "zod": "4.6.5"

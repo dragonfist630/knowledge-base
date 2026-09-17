@@ -12,3 +12,8 @@ playwright-report
 test-results
 .DS_Store
 *.log
+
+# apps/api Gate 3 e2e harness (test/e2e/global-setup.ts) — downloaded
+# PostgREST binary and the per-run connection-info file it writes/reads.
+/.cache/postgrest
+apps/api/test/e2e/.runtime.json
