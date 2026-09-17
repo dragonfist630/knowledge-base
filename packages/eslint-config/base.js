@@ -22,6 +22,21 @@ export const baseConfig = [
       ],
       "@typescript-eslint/consistent-type-imports": "warn",
       "no-console": ["warn", { allow: ["warn", "error", "info"] }],
+      "no-restricted-imports": [
+        "error",
+        {
+          paths: [
+            {
+              name: "openai",
+              message:
+                "Import the provider-agnostic ChatModel/EmbeddingModel from @kb/ai instead. " +
+                "Only packages/ai/src/openai-compatible/** is allowed to touch the `openai` SDK directly " +
+                "(see that package's eslint.config.js override) — every other caller should go through the " +
+                "abstraction so the app never depends on one vendor's SDK shape.",
+            },
+          ],
+        },
+      ],
     },
   },
   {

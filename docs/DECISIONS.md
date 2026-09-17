@@ -261,3 +261,110 @@ PostgREST-visible), so it didn't need regenerating.
 
 More entries land as Phase 1+ makes their own calls (RLS pattern, chunking
 numbers, hybrid retrieval, etc.).
+
+## Phase 2
+
+### D2.1 — Provider preset table corrected against current vendor docs, not the brief
+
+The brief's presets table was written earlier in 2026. Before hardcoding it
+into `packages/ai/src/presets.ts`, each entry was re-checked against that
+vendor's current (2026-09-17) docs, which caught two real, silent
+discrepancies:
+
+- **Together's base URL**: the brief says `https://api.together.xyz/v1`.
+  Together's own current docs canonicalize on `https://api.together.ai/v1`.
+  `.xyz` still resolves today, but a fresh integration should point at the
+  domain the vendor documents as current, not one that merely still works.
+- **OpenRouter embeddings**: the brief marks `embeddings: false`. OpenRouter
+  has since shipped a stable `POST /api/v1/embeddings` (confirmed against
+  `openrouter.ai/docs/api_reference/embeddings`), so it's now a valid
+  `AI_EMBEDDING_PROVIDER` choice.
+
+Groq's capabilities (`embeddings: false` — no `/embeddings` route in its
+endpoint list) matched the brief and were reconfirmed rather than assumed
+correct by inertia.
+
+One deliberate judgment call beyond what either source claims outright:
+Ollama's preset keeps `streamUsage: false` even though its OpenAI-compat
+layer accepts `stream_options` on some versions. Whether the usage numbers
+it reports back are trustworthy varies across the many local model
+runtimes people run, and silently trusting a possibly-wrong real number is
+worse than always falling back to `gpt-tokenizer` estimation (which is
+explicitly flagged via `TokenUsage.estimated`) — so this stays conservative
+until there's a concrete version/model matrix to key off instead of a
+blanket flag.
+
+### D2.2 — One retry policy for every provider, owned by `retry.ts`, not the SDK's
+
+`OpenAiCompatibleChatModel`/`OpenAiCompatibleEmbeddingModel` construct the
+`openai` SDK client with `maxRetries: 0` and wrap every call in this
+package's own `withRetry()` (full-jitter exponential backoff, retrying only
+`rate_limit` / `unavailable` / `timeout`). This means backoff timing and
+which failures are retryable are identical across OpenAI, Groq, Together,
+OpenRouter, Ollama, and any `custom` endpoint — a provider swap can't
+silently change retry behavior — and `withRetry`'s `sleep`/`random`
+injection points make the backoff math itself unit-testable without real
+timers (`retry.spec.ts`).
+
+### D2.3 — Every adapter error becomes one `AiError`; nothing outside `openai-compatible/` sees the SDK's shape
+
+`openai-compatible/map-error.ts` is the single seam that translates
+whatever the `openai` SDK throws (`APIError` and its subclasses, connection
+errors, abort errors) or any other unexpected throw into an `AiError` with
+one of eight fixed codes. A repo-wide `no-restricted-imports` rule (added to
+`packages/eslint-config/base.js`) blocks importing `openai` anywhere, with a
+single override in `packages/ai/eslint.config.js` re-enabling it for
+`src/openai-compatible/**/*.ts` — the same boundary Gate 2's
+`grep -r "from 'openai'" apps packages --include=*.ts` checks for, now
+enforced continuously by lint instead of only at gate-check time. Phase 3's
+Nest exception filter maps `AiError.code` to an HTTP status and never needs
+to know which vendor actually answered the request.
+
+### D2.4 — Contract tests run identically against the mock models and the real HTTP adapter
+
+`src/contract.ts` defines the behavioral contract every `ChatModel` /
+`EmbeddingModel` must satisfy (non-negative usage, exactly one `finish` per
+stream, abort handling, descriptor shape) once, and both `MockChatModel`
+and `OpenAiCompatibleChatModel` run it — the latter via `msw`'s Node server
+stubbing an OpenAI-compatible HTTP endpoint
+(`openai-compatible/test-support/msw-server.ts`), so the real adapter is
+exercised against realistic request/response shapes (including SSE
+streaming with a trailing usage-only chunk) without a live API key or
+network call in CI.
+
+Writing the abort-mid-stream test for the real adapter surfaced a genuine
+bug, not a test artifact — reproduced independently against a plain Node
+`http` server, not just MSW: aborting an in-flight OpenAI-compatible stream
+*after* at least one chunk has already arrived does not make the SDK's
+`for await` throw. The response body simply ends, so the loop finishes as
+if the stream completed normally. `chat-model.ts`'s `stream()` previously
+only recognized an abort in two places — the per-chunk `signal.aborted`
+check at the top of the loop, and the `catch` block around the loop — both
+of which assume the abort surfaces as either a check hit before the next
+chunk or a thrown error. Neither happens in this case, so the post-loop
+fallback (used when the provider never sent a usage chunk) was reporting
+whatever `finishReason` happened to be set from the last processed chunk —
+`"other"` here — instead of `"aborted"`, and estimated usage as if the
+response had completed normally. Fixed by re-checking `opts.signal?.aborted`
+at that fallback site and reporting `"aborted"` there too, so an abort is
+never misreported as a normal finish just because of exactly when the
+underlying connection happened to close relative to the last chunk.
+
+### D2.5 — `pnpm ai:check` (`apps/api/src/cli/ai-check.ts`) as the manual verification step
+
+Config resolution has its own exhaustive unit tests (`config.spec.ts`), but
+nothing in the automated suite makes a real network call to a real
+provider — deliberately, so `pnpm test` stays fast, deterministic, and
+runnable with no API keys in CI. `ai:check` is the manual bridge: it loads
+the same root `.env` `apps/api` boots with, resolves config through the same
+`createAi()` application code uses, prints the resolved
+provider/model/base URL with the API key masked, then makes one real
+1-token chat completion and one real 1-input embedding call and reports
+latency, finish reason, dimensions, and whether usage was provider-reported
+or estimated. On failure it prints the `AiError` code plus a short,
+code-specific remediation hint (bad key, wrong model name, unreachable
+base URL, etc.) instead of a raw stack trace. Verified against all three
+outcomes: the default keyless mock config (passes, ~0ms), a provider
+missing its required API key (fails at config-resolution, before any
+network call), and an unreachable `custom` base URL (fails at the chat
+step with `unavailable` and the connection-refused detail).

@@ -17,17 +17,26 @@
     "dev": "tsup --watch",
     "typecheck": "tsc --noEmit",
     "lint": "eslint . --max-warnings 0",
-    "test": "echo \"no tests yet (Phase 2)\" && exit 0",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:live": "AI_CONTRACT_LIVE=1 vitest run",
     "clean": "rm -rf dist .turbo"
   },
   "devDependencies": {
     "@kb/eslint-config": "workspace:*",
     "@kb/tsconfig": "workspace:*",
+    "@types/node": "22.20.3",
+    "@vitest/coverage-v8": "4.1.2",
     "eslint": "10.10.0",
+    "msw": "2.15.0",
     "tsup": "8.5.1",
-    "typescript": "5.9.3"
+    "typescript": "5.9.3",
+    "vite-tsconfig-paths": "5.1.4",
+    "vitest": "4.1.2"
   },
   "dependencies": {
+    "gpt-tokenizer": "4.0.0",
+    "openai": "7.17.0",
     "zod": "4.6.5"
   }
 }
