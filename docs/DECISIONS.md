@@ -368,3 +368,64 @@ outcomes: the default keyless mock config (passes, ~0ms), a provider
 missing its required API key (fails at config-resolution, before any
 network call), and an unreachable `custom` base URL (fails at the chat
 step with `unavailable` and the connection-refused detail).
+
+### D2.6 — Independent re-validation found `stream()` silently never retried, fixed
+
+After the initial Phase 2 push, ran a second, independent validation pass
+(same standard as D1.5): fresh `git clone` of the pushed commit, `pnpm
+install --frozen-lockfile` (confirming the lockfile generated on a
+different machine truly matches `package.json`, not just "happened to
+install" with `--no-frozen-lockfile`), then the full `pnpm lint /
+typecheck / build / test` and `pnpm ai:check` from scratch, plus a
+skeptical, from-scratch adversarial read of every non-test file in
+`packages/ai/src` — deliberately not trusting the first pass's own tests
+as proof of correctness, the same way D1.5 went looking for gaps Gate 1's
+literal checklist didn't cover.
+
+That read caught a real, silent bug: `OpenAiCompatibleChatModel.complete()`
+maps the OpenAI SDK's raw error to an `AiError` *inside* the function
+passed to `withRetry()`, so `withRetry`'s `isAiError(error) &&
+error.retryable` check sees the mapped error and retries correctly.
+`stream()`'s initial `create()` call had no such mapping — the raw SDK
+error (e.g. `OpenAI.RateLimitError`) reached `withRetry` directly,
+`isAiError()` returned `false` for it every time, and `withRetry` gave up
+after exactly one attempt regardless of `AI_MAX_RETRIES`. The mapping to
+`AiError` only happened afterward, in `stream()`'s outer `catch`, by which
+point the retry decision had already been made. Net effect: streaming
+requests silently never retried on `rate_limit` / `unavailable` /
+`timeout`, while non-streaming `complete()` calls did — a real functional
+gap between the two code paths that the existing test suite didn't catch,
+because the only retry-specific tests exercised `complete()` and
+`retry.ts` in isolation, never `stream()`'s retry behavior specifically.
+
+Fixed by wrapping `stream()`'s initial `create()` call in the same
+try/mapOpenAiError pattern `complete()` already uses, so both code paths
+reach `withRetry` with an already-classified `AiError`. Added two
+regression tests to `chat-model.spec.ts`: one drives a fake provider that
+returns two `429`s before succeeding and confirms `stream()` actually
+retries and reports the eventual successful text; the other confirms
+`maxRetries: 0` still gives up after exactly one attempt (so the fix
+didn't accidentally make retries unconditional). Verified the first test
+fails against the pre-fix code (confirmed by temporarily reverting just
+`chat-model.ts` and re-running) and passes against the fix, so it's a real
+regression test and not one that would pass either way.
+
+Separately, this pass also closed a gap in the `no-restricted-imports`
+lint rule from D2.3: that rule's `paths` option only matches static
+`import ... from "openai"` / `export ... from "openai"` — it does not
+catch a dynamic `import("openai")` or `require("openai")`, and neither of
+those forms uses the word `from`, so both would also have slipped past
+Gate 2's `grep -r "from 'openai'"` check undetected. Added a
+`no-restricted-syntax` rule with AST selectors for
+`ImportExpression[source.value='openai']` and
+`require('openai')`-shaped `CallExpression`s to `packages/eslint-config/base.js`,
+with the same directory-scoped override in `packages/ai/eslint.config.js`.
+Verified with the same drill as D2.3's rule: a dynamic import outside
+`openai-compatible/` now errors, the same import inside that directory is
+allowed, and the whole workspace still lints clean.
+
+Re-ran the full suite after both fixes (fresh clone, frozen-lockfile
+install, lint, typecheck, build, `pnpm test`, `pnpm ai:check`): 81/81
+tests pass (79 + the 2 new retry regression tests), Gate 2's grep check
+still confined to `packages/ai/src/openai-compatible/**`, and no secrets,
+`.env` files, or other committed credentials found in a repo-wide scan.

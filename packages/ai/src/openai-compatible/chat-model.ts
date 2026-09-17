@@ -135,11 +135,25 @@ export class OpenAiCompatibleChatModel implements ChatModel {
 
     try {
       const streamResponse = await withRetry(
-        () =>
-          this.client.chat.completions.create(
-            this.buildParams(messages, opts, true) as OpenAI.Chat.ChatCompletionCreateParamsStreaming,
-            { signal: opts.signal },
-          ),
+        async () => {
+          try {
+            return await this.client.chat.completions.create(
+              this.buildParams(messages, opts, true) as OpenAI.Chat.ChatCompletionCreateParamsStreaming,
+              { signal: opts.signal },
+            );
+          } catch (error) {
+            // Map to AiError *before* it reaches withRetry's catch — withRetry
+            // only retries AiErrors whose `.retryable` is true (isAiError()
+            // is false for a raw SDK error), so without this the initial
+            // connection attempt for a stream would never actually retry on
+            // rate_limit/unavailable/timeout, silently defeating maxRetries
+            // for the entire streaming path. complete() already does this;
+            // stream() previously didn't, and only mapped the error in the
+            // outer catch below — by which point withRetry had already given
+            // up after a single attempt.
+            throw mapOpenAiError(error, this.descriptor.provider);
+          }
+        },
         { maxRetries: this.maxRetries, signal: opts.signal },
       );
 

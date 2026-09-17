@@ -37,6 +37,28 @@ export const baseConfig = [
           ],
         },
       ],
+      // `no-restricted-imports`'s `paths` option only catches static
+      // `import ... from "openai"` / `export ... from "openai"` — it does
+      // NOT catch `import("openai")` (dynamic import) or `require("openai")`,
+      // both of which would also dodge Gate 2's `grep "from 'openai'"`
+      // check since neither uses the `from` keyword. Block those forms
+      // explicitly via AST selectors so there's no unenforced backdoor.
+      "no-restricted-syntax": [
+        "error",
+        {
+          selector: "ImportExpression[source.value='openai']",
+          message:
+            "Dynamic import of 'openai' is restricted, same as a static import — see the " +
+            "no-restricted-imports message for 'openai' above.",
+        },
+        {
+          selector:
+            "CallExpression[callee.name='require'][arguments.0.value='openai']",
+          message:
+            "require('openai') is restricted, same as a static import — see the " +
+            "no-restricted-imports message for 'openai' above.",
+        },
+      ],
     },
   },
   {

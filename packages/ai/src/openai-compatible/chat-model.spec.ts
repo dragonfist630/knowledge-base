@@ -181,4 +181,76 @@ describe("OpenAiCompatibleChatModel", () => {
       expect(error.code).toBe("invalid_response");
     }
   });
+
+  it("stream() retries a 429 on the initial connection and then streams normally", async () => {
+    // Regression test: the raw OpenAI SDK error thrown by create() must be
+    // mapped to an AiError *before* it reaches withRetry, or withRetry's
+    // isAiError() check silently never retries (see chat-model.ts's inline
+    // comment on this exact bug, and docs/DECISIONS.md D2.6).
+    let attempts = 0;
+    const encoder = new TextEncoder();
+    server.use(
+      http.post(`${FAKE_BASE_URL}/chat/completions`, () => {
+        attempts += 1;
+        if (attempts < 3) {
+          return HttpResponse.json({ error: { message: "slow down" } }, { status: 429 });
+        }
+        const stream = new ReadableStream({
+          start(controller) {
+            const send = (obj: unknown) =>
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
+            send({
+              id: "x",
+              object: "chat.completion.chunk",
+              choices: [{ index: 0, delta: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+            });
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+            controller.close();
+          },
+        });
+        return new HttpResponse(stream, { headers: { "Content-Type": "text/event-stream" } });
+      }),
+    );
+
+    const model = makeModel({ maxRetries: 3 });
+    let text = "";
+    let finishReason: string | undefined;
+    for await (const part of model.stream([{ role: "user", content: "hi" }])) {
+      if (part.type === "text-delta") text += part.text;
+      if (part.type === "finish") finishReason = part.finishReason;
+    }
+
+    expect(attempts).toBe(3); // 2 failed attempts + 1 that succeeded
+    expect(text).toBe("ok");
+    expect(finishReason).toBe("stop");
+  });
+
+  it("stream() gives up immediately (no retry) once maxRetries is exhausted, surfacing a retryable AiError", async () => {
+    let attempts = 0;
+    server.use(
+      http.post(`${FAKE_BASE_URL}/chat/completions`, () => {
+        attempts += 1;
+        return HttpResponse.json({ error: { message: "slow down" } }, { status: 429 });
+      }),
+    );
+
+    const model = makeModel({ maxRetries: 0 });
+    const error = await (async () => {
+      try {
+        for await (const _part of model.stream([{ role: "user", content: "hi" }])) {
+          // draining is enough to trigger the throw, if any
+        }
+        return undefined;
+      } catch (e) {
+        return e;
+      }
+    })();
+
+    expect(attempts).toBe(1);
+    expect(isAiError(error)).toBe(true);
+    if (isAiError(error)) {
+      expect(error.code).toBe("rate_limit");
+      expect(error.retryable).toBe(true);
+    }
+  });
 });

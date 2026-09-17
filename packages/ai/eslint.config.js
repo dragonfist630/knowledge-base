@@ -14,6 +14,7 @@ export default [
     files: ["src/openai-compatible/**/*.ts"],
     rules: {
       "no-restricted-imports": "off",
+      "no-restricted-syntax": "off",
     },
   },
 ];
