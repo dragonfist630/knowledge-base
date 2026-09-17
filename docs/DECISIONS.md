@@ -760,3 +760,43 @@ Re-ran the full pipeline from the same fresh clone after all fixes:
 `pnpm lint` / `typecheck` / `build` / `test` clean across every
 workspace, and `apps/api`'s `pnpm test:e2e` at 12/12 (the original 8 plus
 the 4 new cases above).
+
+### D3.7 — `documents.service.ts` had a literal raw NUL byte embedded in its source
+
+Found on a follow-up, even more skeptical pass (the person asked "is this
+really fixable?" about a `file`/`grep` classification oddity flagged
+independently): `computeContentHash`'s `.update(" ")` call — read and
+documented earlier (D3.4's writeup, and this file's own D3.2) as using a
+plain space separator — actually contained a literal raw `0x00` byte
+inside the string literal, not the printable space character it looked
+like in every editor/terminal rendering along the way. `file` classified
+the whole file as `data` (binary) because of it; `grep -n` on the file
+warned "binary file matches" for the same reason. Neither `tsc`,
+`eslint`, `nest build`, nor any test ever caught it, because a raw NUL
+byte inside a string literal is completely valid TypeScript — it compiles
+and runs identically to the properly-escaped `"\0"` — so nothing in the
+pipeline had a reason to flag it. It's likely how it got there in the
+first place: the original design was a null-byte separator (deliberately
+chosen so it can never collide with real title/content text), and at
+some point during authoring the two source characters `\` and `0` came
+out as one raw control byte instead.
+
+Confirmed there was zero behavioral drift before fixing it: computed the
+hash of the same `(title, content)` pair two ways — once via Node with
+the properly-escaped `"\0"`, once via Python writing the identical raw
+`0x00` byte directly — and both produced the exact same SHA-256 digest.
+So this was a pure source-hygiene bug, not a hash/behavior bug: nothing
+depended on today's exact hash values anyway (no real data exists yet),
+and `documents.service.spec.ts`'s existing boundary-collision test
+(`("a","bc")` vs. `("ab","c")`) already covered the actual thing a
+separator is for.
+
+Fixed by replacing the raw byte with the `\0` escape sequence (verified
+byte-for-byte identical resulting hash, see above). Added
+`no-embedded-control-bytes.spec.ts`, modeled directly on the existing
+`no-service-role-key.spec.ts` pattern: it scans every non-spec `.ts` file
+under `apps/api/src` for any raw control byte other than
+tab/newline/carriage-return and fails the build if one is found — so this
+exact class of bug (valid, compiling, passing-every-existing-test, but
+literally not text) gets a real automated check instead of depending on
+someone noticing `file` or `grep` complain about a specific source file.

@@ -100,3 +100,18 @@ test. This is the clearest example so far of why "the tests pass" and
 pass — ideally from a fresh clone, checked against the original spec
 rather than the first pass's own checklist — catches things the first
 pass's own definition of done cannot.
+
+A third pass on the same phase, prompted by a specific claim to verify
+("does this file really still have a raw NUL byte in it, wasn't that
+supposedly fixed?"), found a genuinely strange one: `documents.service.ts`
+compiled, typechecked, built, and passed every test the whole time, but
+had a literal raw `0x00` byte sitting inside a string literal instead of
+the printable escape sequence `\0` — invisible in every editor and every
+tool output along the way, only visible to `file`/`grep -a`/a byte-level
+read. It never mattered at runtime (verified the hash output is
+byte-for-byte identical either way), but it's a good reminder that
+"the pipeline is green" only checks what the pipeline can see — a raw
+control byte inside a valid string literal is invisible to `tsc`,
+`eslint`, and a test suite that only checks behavior. Fixed, and added a
+small automated check for this exact class of thing (D3.7) rather than
+relying on a person noticing an odd `file` classification next time.
