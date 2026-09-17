@@ -81,3 +81,22 @@ PostgREST binary + hand-minted JWTs standing in for local Supabase/GoTrue
 have been, and one that exercises `AuthGuard`'s actual production
 verification path (getClaims-first, HS256-fallback) rather than a
 test-only code path (D3.1).
+
+Separately asked, after the phase was "done": "is this really done,
+without gaps or bugs?" — a genuine independent re-validation, not just
+re-running the same tests. From a fresh clone, checked the code against
+the brief's literal Phase 3 checklist rather than only Gate 3's four
+bullet points, and found a real one: `AuthGuard` verified a JWT's
+signature but never checked its `role` claim, so a hand-minted
+`role: "service_role"` token with the well-known local signing secret
+authenticated successfully — undermining the app's own "no service-role
+access" invariant. Proved it concretely (a probe request, not just
+reasoning about it) before fixing it, then fixed and added a permanent
+regression test (D3.6). The same pass also found real endpoints with zero
+test coverage (list search/tag/pagination, reindex) despite being fully
+implemented — an "it works" that had never actually been exercised by a
+test. This is the clearest example so far of why "the tests pass" and
+"the feature is done" aren't the same claim, and why a second, skeptical
+pass — ideally from a fresh clone, checked against the original spec
+rather than the first pass's own checklist — catches things the first
+pass's own definition of done cannot.

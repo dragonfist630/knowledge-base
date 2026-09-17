@@ -694,3 +694,69 @@ update against the real `IndexingQueue`), and `pnpm ai:check` (mock
 provider, both chat and embedding). Confirmed the e2e harness tears down
 cleanly (no orphaned PostgREST/proxy processes, `kb_e2e_test` dropped)
 after both a passing and (during D3.3/D3.4 debugging) a failing run.
+
+### D3.6 — Independent re-validation found `AuthGuard` never checked the JWT's `role` claim
+
+Prompted by a direct "is Phase 3 really done, without gaps or bugs"
+request — the same standard as D1.5/D2.6's independent re-validation
+passes, done from a truly fresh `git clone` of the pushed commit (not the
+working tree that built it), with a skeptical read against the brief's
+literal Phase 3 checklist rather than trusting Gate 3's four bullet
+points as the full picture.
+
+Two things stood out immediately: `AuthGuard`'s local fallback doesn't
+call `supabase.auth.getUser()`, which is what the brief literally names
+("fall back to getUser if the local stack uses symmetric HS256"), and
+neither verification path (`getClaims()` nor the local fallback) ever
+checked the token's `role` claim. The first is a deliberate, now-documented
+deviation (see the updated `auth.guard.ts` docstring): `getUser()` needs a
+running Supabase Auth server to call, and this environment has none at
+all (D3.1), so it would fail the same way `getClaims()` does, just for an
+unrelated reason. The second is a real bug, and worth demonstrating
+concretely rather than trusting the theory: a JWT hand-minted with
+`role: "service_role"` and the correct (well-known local) signing secret
+was accepted by `AuthGuard` exactly as if it were a normal user's token,
+because nothing ever compared the `role` claim against `"authenticated"`.
+
+A forged `service_role` token handed to `createUserScopedClient` makes
+PostgREST switch the underlying Postgres role to `service_role` — which
+has `bypassrls` (see `apps/api/test/e2e/bootstrap.sql` and a real
+project's platform setup). In *this* schema specifically, the probe came
+back `403`, not a data leak, only because the Phase 1 migration's grants
+(`supabase/migrations/*.sql`) never gave `service_role` table privileges
+on `public.documents` in the first place — an incidental mitigation, not
+a designed one, and one a future migration could easily undo (a Phase 4
+background indexing worker, for instance, is a plausible reason to grant
+`service_role` broader access later). `AuthGuard` itself provided no
+defense-in-depth against this at all, which directly undermines the
+project's own stated invariant: "no service-role access in apps/api."
+
+Fixed by rejecting any token whose `role` claim isn't `"authenticated"`
+in both `verifyViaGetClaims` and `verifyViaLocalSecret` — a cheap check
+that makes the "no service-role access" guarantee hold regardless of what
+any given schema's grants happen to allow. Added a regression test
+(`documents.e2e-spec.ts`, "rejects a non-'authenticated' role JWT") that
+mints both a `service_role` and an `anon` token with the real owner's own
+`sub` claim (so the only thing wrong with either token is its role) and
+asserts both get `401`; confirmed against the pre-fix code that the
+`service_role` case actually returns something other than 401 (`403`, per
+the probe above) before trusting the fix.
+
+The same re-validation pass also found real, if lower-severity, test
+coverage gaps against the brief's Phase 3 endpoint list: `GET /documents`
+query search (`q`, `tag`), pagination (`limit`/`cursor`), and
+`POST /documents/:id/reindex` were all implemented but had zero test
+coverage — Gate 3's four bullet points don't mention them, but the brief's
+own endpoint list does. Added `documents.e2e-spec.ts` cases for all three:
+`q` search including a literal `%` in the search term (proving
+`escapeIlike` actually works, not just that it exists), `tag` filtering,
+two-page pagination that covers a seeded set exactly once with no overlap,
+and `reindex`'s `409` (not-failed document) / `404` (nonexistent, and
+cross-user via RLS) responses. Also added a `400` case for a
+completely malformed (non-JWT-shaped) bearer token, which was previously
+only implicitly covered.
+
+Re-ran the full pipeline from the same fresh clone after all fixes:
+`pnpm lint` / `typecheck` / `build` / `test` clean across every
+workspace, and `apps/api`'s `pnpm test:e2e` at 12/12 (the original 8 plus
+the 4 new cases above).

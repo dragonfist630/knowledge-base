@@ -23,7 +23,9 @@ interface VerifiedClaims {
  * Bearer <jwt> -> req.auth = { userId, email, db }. `db` is a Supabase
  * client built from the publishable key plus this exact JWT, so every
  * downstream query runs under RLS as this user — no service-role client
- * exists anywhere in this app.
+ * exists anywhere in this app. Both verification paths below also reject
+ * any token whose `role` claim isn't `"authenticated"` — a service_role
+ * (or anon) token must never reach `createUserScopedClient` — see D3.6.
  *
  * Verification tries `getClaims()` first: against a real (local or hosted)
  * Supabase project this does local, network-light verification against the
@@ -34,6 +36,16 @@ interface VerifiedClaims {
  * against and getClaims() throws. See docs/DECISIONS.md Phase 3 (D3.1) for
  * why this fallback exists and how it's exercised in the e2e tests without
  * Docker in this environment.
+ *
+ * The fallback here is a hand-rolled local HS256 `jose` verification, not
+ * `supabase.auth.getUser()` — a deliberate, documented deviation from the
+ * literal spec (which assumes a *running* local Supabase whose GoTrue just
+ * lacks a JWKS endpoint, so `getUser()`'s network round trip to it still
+ * succeeds). This environment has no Supabase Auth server running at all
+ * (no Docker, ever — see D3.1), so `getUser()` would fail here exactly the
+ * same way `getClaims()` does, for an unrelated reason (no server to call,
+ * not "no JWKS"). See D3.6 for the full rationale and what changes for
+ * anyone who *does* have Docker and runs a real `supabase start`.
  */
 @Injectable()
 export class AuthGuard implements CanActivate {
@@ -94,6 +106,15 @@ export class AuthGuard implements CanActivate {
     if (error || !data?.claims || typeof data.claims.sub !== "string") {
       return undefined;
     }
+    // Only ever authenticate as the "authenticated" role. Without this,
+    // any JWT signed by the project's key — including a service_role
+    // token, which bypasses RLS entirely — would authenticate here and
+    // then be handed straight to createUserScopedClient, undermining the
+    // "no service-role access in apps/api" guarantee documented in
+    // supabase-client.factory.ts. See docs/DECISIONS.md Phase 3, D3.6.
+    if (data.claims.role !== "authenticated") {
+      return undefined;
+    }
     const email = typeof data.claims.email === "string" ? data.claims.email : undefined;
     return { userId: data.claims.sub, email };
   }
@@ -106,6 +127,9 @@ export class AuthGuard implements CanActivate {
       const secret = new TextEncoder().encode(this.env.SUPABASE_JWT_SECRET);
       const { payload } = await jwtVerify(token, secret, { algorithms: ["HS256"] });
       if (typeof payload.sub !== "string") return undefined;
+      // Same role restriction as verifyViaGetClaims — see the comment
+      // there and D3.6.
+      if (payload.role !== "authenticated") return undefined;
       const email = typeof payload.email === "string" ? payload.email : undefined;
       return { userId: payload.sub, email };
     } catch {

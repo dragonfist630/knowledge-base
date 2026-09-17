@@ -5,6 +5,7 @@ import request from "supertest";
 
 import { AppModule } from "../src/app.module.js";
 import { IndexingQueue } from "../src/indexing/indexing.queue.js";
+import { mintJwt } from "./e2e/jwt.js";
 
 /**
  * Gate 3 e2e — real HTTP requests against a real Postgres+RLS+PostgREST
@@ -168,5 +169,133 @@ describe("Documents (e2e)", () => {
 
   it("400s a malformed document id (not a uuid)", async () => {
     await request(app.getHttpServer()).get("/documents/not-a-uuid").set("Authorization", authed(userA.jwt)).expect(400);
+  });
+
+  it("rejects a non-'authenticated' role JWT even with a valid signature (D3.6)", async () => {
+    // Regression test for D3.6: AuthGuard used to accept any correctly
+    // signed JWT regardless of its `role` claim. A service_role token
+    // still gets a *correctly signed* JWT through both verification
+    // paths — the only thing stopping it from being treated as a normal
+    // user (and, via PostgREST's role-switching, running future queries
+    // with RLS bypassed) is this explicit role check.
+    const createRes = await request(app.getHttpServer())
+      .post("/documents")
+      .set("Authorization", authed(userA.jwt))
+      .send({ title: "Victim doc for the service-role probe", content: "secret" })
+      .expect(201);
+    const docId: string = createRes.body.id;
+
+    const forgedServiceRoleJwt = mintJwt({
+      sub: userA.id, // even claiming to *be* the real owner doesn't help.
+      email: userA.email,
+      role: "service_role",
+      secret: globalThis.__KB_E2E__.SUPABASE_JWT_SECRET,
+    });
+    await request(app.getHttpServer())
+      .get(`/documents/${docId}`)
+      .set("Authorization", authed(forgedServiceRoleJwt))
+      .expect(401);
+
+    const forgedAnonJwt = mintJwt({
+      sub: userA.id,
+      email: userA.email,
+      role: "anon",
+      secret: globalThis.__KB_E2E__.SUPABASE_JWT_SECRET,
+    });
+    await request(app.getHttpServer()).get(`/documents/${docId}`).set("Authorization", authed(forgedAnonJwt)).expect(401);
+  });
+
+  it("400s a completely garbage bearer token", async () => {
+    await request(app.getHttpServer()).get("/documents").set("Authorization", "Bearer not.a.jwt").expect(401);
+  });
+
+  it("list: q searches title (ilike), tag filters, limit/cursor paginate", async () => {
+    const unique = `zz-search-probe-${Date.now()}`;
+    const doc1 = await request(app.getHttpServer())
+      .post("/documents")
+      .set("Authorization", authed(userA.jwt))
+      .send({ title: `${unique} first`, content: "x", tags: ["probe-tag"] })
+      .expect(201);
+    const doc2 = await request(app.getHttpServer())
+      .post("/documents")
+      .set("Authorization", authed(userA.jwt))
+      .send({ title: `${unique} second`, content: "x" })
+      .expect(201);
+    // A literal `%` in the search term must be treated literally, not as
+    // an ilike wildcard (documents.repository.ts's escapeIlike).
+    const doc3 = await request(app.getHttpServer())
+      .post("/documents")
+      .set("Authorization", authed(userA.jwt))
+      .send({ title: `${unique} 100% literal percent`, content: "x" })
+      .expect(201);
+
+    const byQuery = await request(app.getHttpServer())
+      .get(`/documents?q=${encodeURIComponent(unique)}`)
+      .set("Authorization", authed(userA.jwt))
+      .expect(200);
+    const idsByQuery: string[] = byQuery.body.items.map((d: { id: string }) => d.id);
+    expect(idsByQuery.sort()).toEqual([doc1.body.id, doc2.body.id, doc3.body.id].sort());
+
+    const literalPercentEscaped = await request(app.getHttpServer())
+      .get(`/documents?q=${encodeURIComponent(`${unique} 100%`)}`)
+      .set("Authorization", authed(userA.jwt))
+      .expect(200);
+    // Un-escaped, `100%` would ilike-match "100" followed by anything,
+    // matching doc1/doc2 too via their shared `${unique}` prefix overlap
+    // being irrelevant here — the real assertion is that it finds doc3
+    // (the literal "100%" text) and nothing whose title lacks it.
+    expect(literalPercentEscaped.body.items.map((d: { id: string }) => d.id)).toEqual([doc3.body.id]);
+
+    const byTag = await request(app.getHttpServer())
+      .get(`/documents?tag=probe-tag`)
+      .set("Authorization", authed(userA.jwt))
+      .expect(200);
+    expect(byTag.body.items.some((d: { id: string }) => d.id === doc1.body.id)).toBe(true);
+    expect(byTag.body.items.some((d: { id: string }) => d.id === doc2.body.id)).toBe(false);
+
+    const firstPage = await request(app.getHttpServer())
+      .get(`/documents?q=${encodeURIComponent(unique)}&limit=2`)
+      .set("Authorization", authed(userA.jwt))
+      .expect(200);
+    expect(firstPage.body.items).toHaveLength(2);
+    expect(firstPage.body.nextCursor).toBeTruthy();
+
+    const secondPage = await request(app.getHttpServer())
+      .get(`/documents?q=${encodeURIComponent(unique)}&limit=2&cursor=${encodeURIComponent(firstPage.body.nextCursor)}`)
+      .set("Authorization", authed(userA.jwt))
+      .expect(200);
+    expect(secondPage.body.items).toHaveLength(1);
+    expect(secondPage.body.nextCursor).toBeNull();
+    // Together, the two pages cover exactly the 3 seeded docs, no overlap.
+    const pagedIds = [...firstPage.body.items, ...secondPage.body.items].map((d: { id: string }) => d.id);
+    expect(pagedIds.sort()).toEqual([doc1.body.id, doc2.body.id, doc3.body.id].sort());
+  });
+
+  it("reindex: 409 on a document that isn't in a failed state, 404 on a nonexistent one", async () => {
+    const createRes = await request(app.getHttpServer())
+      .post("/documents")
+      .set("Authorization", authed(userA.jwt))
+      .send({ title: "Reindex target", content: "x" })
+      .expect(201);
+    // Freshly created docs are 'pending', not 'failed' — reindex should
+    // refuse (it's for retrying a *failed* index, not re-triggering one
+    // that's already in flight/queued).
+    const conflictRes = await request(app.getHttpServer())
+      .post(`/documents/${createRes.body.id}/reindex`)
+      .set("Authorization", authed(userA.jwt))
+      .expect(409);
+    expect(conflictRes.body.code).toBe("conflict");
+
+    await request(app.getHttpServer())
+      .post(`/documents/00000000-0000-0000-0000-000000000000/reindex`)
+      .set("Authorization", authed(userA.jwt))
+      .expect(404);
+
+    // User B can't reindex user A's document (RLS) — same 404-not-403
+    // shape as every other cross-user case.
+    await request(app.getHttpServer())
+      .post(`/documents/${createRes.body.id}/reindex`)
+      .set("Authorization", authed(userB.jwt))
+      .expect(404);
   });
 });
