@@ -103,8 +103,11 @@ create table public.ai_usage_events (
 
 create index ai_usage_user_created_idx on public.ai_usage_events (user_id, created_at desc);
 
--- updated_at trigger --------------------------------------------------------
+-- updated_at triggers --------------------------------------------------------
 
+-- Unconditional: any update to a conversations row (including the
+-- "touch conversations.updated_at" write a finished chat turn makes purely
+-- to reorder the conversation list by recency) should bump updated_at.
 create or replace function public.set_updated_at()
 returns trigger
 language plpgsql
@@ -116,9 +119,27 @@ begin
 end;
 $$;
 
+-- documents is different: index_status/index_error/chunk_count/indexed_at
+-- are written by the background indexing pipeline (replace_document_chunks),
+-- not by the user, so those writes must NOT bump updated_at — only a real
+-- edit to title/content/tags should. Without this, every reindex would make
+-- a document look "just edited" in any updated_at-sorted list.
+create or replace function public.set_documents_updated_at()
+returns trigger
+language plpgsql
+set search_path = public
+as $$
+begin
+  if (new.title, new.content, new.tags) is distinct from (old.title, old.content, old.tags) then
+    new.updated_at = now();
+  end if;
+  return new;
+end;
+$$;
+
 create trigger documents_set_updated_at
   before update on public.documents
-  for each row execute function public.set_updated_at();
+  for each row execute function public.set_documents_updated_at();
 
 create trigger conversations_set_updated_at
   before update on public.conversations
@@ -223,53 +244,104 @@ security invoker
 stable
 set search_path = public, extensions
 as $$
-  with scoped as (
-    select c.*, d.title as document_title
+  -- Two things defeat the HNSW index here, not just one:
+  --
+  -- 1. A shared `scoped` CTE referenced more than once is materialized
+  --    (PG12+ semantics) before either branch runs, so the planner sorts the
+  --    whole materialized set instead of probing the index. Fixed by giving
+  --    each branch its own CTE, referenced exactly once.
+  --
+  -- 2. Less obviously: `filter_tags` lives on `documents`, not
+  --    `document_chunks`, so applying it means joining `documents` *before*
+  --    the `order by ... limit`. Once that join is in the same subquery as
+  --    the ORDER BY, Postgres plans a join-then-sort instead of an
+  --    index-driven top-k scan, even with a per-branch CTE. Proven
+  --    empirically at 60k-row scale: the join alone (independent of any CTE
+  --    sharing) was enough to keep the planner on a Bitmap Heap Scan + Sort.
+  --
+  -- Fix: run each branch's `order by ... limit` against document_chunks
+  -- alone, filtered only by columns document_chunks already has
+  -- (user_id, document_id) — both index-friendly, neither needs a join.
+  -- `filter_tags` is applied afterward, against the over-fetched candidate
+  -- set, which is the standard "over-fetch then post-filter" pattern for
+  -- combining a JOIN-based filter with ANN search. This trades a small,
+  -- bounded amount of recall (a candidate that would have ranked in the top
+  -- N but falls outside the wider over-fetch window before the tag filter
+  -- is applied) for actually using the index; match_count*8 keeps that risk
+  -- low without materially changing latency. filter_tags is the uncommon
+  -- path (most calls pass none), so this keeps the common path fully
+  -- index-driven and only pays the wider scan when tags are actually used.
+  with semantic_raw as (
+    select
+      c.id,
+      c.document_id,
+      1 - (c.embedding <=> query_embedding) as similarity
     from public.document_chunks c
-    join public.documents d on d.id = c.document_id
     where c.user_id = (select auth.uid())
       and (filter_document_ids is null or c.document_id = any(filter_document_ids))
-      and (filter_tags is null or d.tags && filter_tags)
+    order by c.embedding <=> query_embedding
+    limit match_count * 8
   ),
   semantic as (
     select
-      s.id,
-      1 - (s.embedding <=> query_embedding) as similarity,
-      row_number() over (order by s.embedding <=> query_embedding) as rank
-    from scoped s
-    order by s.embedding <=> query_embedding
+      sr.id,
+      sr.similarity,
+      row_number() over (order by sr.similarity desc) as rank
+    from semantic_raw sr
+    join public.documents d on d.id = sr.document_id
+    where (filter_tags is null or d.tags && filter_tags)
+    order by sr.similarity desc
     limit match_count * 4
+  ),
+  keyword_raw as (
+    select
+      c.id,
+      c.document_id,
+      ts_rank_cd(c.fts, websearch_to_tsquery('english', query_text)) as text_rank
+    from public.document_chunks c
+    where c.user_id = (select auth.uid())
+      and (filter_document_ids is null or c.document_id = any(filter_document_ids))
+      and c.fts @@ websearch_to_tsquery('english', query_text)
+    order by text_rank desc
+    limit match_count * 8
   ),
   keyword as (
     select
-      s.id,
-      ts_rank_cd(s.fts, websearch_to_tsquery('english', query_text)) as text_rank,
-      row_number() over (
-        order by ts_rank_cd(s.fts, websearch_to_tsquery('english', query_text)) desc
-      ) as rank
-    from scoped s
-    where s.fts @@ websearch_to_tsquery('english', query_text)
-    order by text_rank desc
+      kr.id,
+      kr.text_rank,
+      row_number() over (order by kr.text_rank desc) as rank
+    from keyword_raw kr
+    join public.documents d on d.id = kr.document_id
+    where (filter_tags is null or d.tags && filter_tags)
+    order by kr.text_rank desc
     limit match_count * 4
+  ),
+  fused as (
+    select
+      coalesce(sem.id, kw.id) as id,
+      coalesce(sem.similarity, 0) as similarity,
+      coalesce(kw.text_rank, 0) as text_rank,
+      coalesce(1.0 / (60 + sem.rank), 0) + coalesce(1.0 / (60 + kw.rank), 0) as score
+    from semantic sem
+    full outer join keyword kw on kw.id = sem.id
+    where coalesce(sem.similarity, 0) >= min_similarity or kw.id is not null
   )
   select
-    s.id as chunk_id,
-    s.document_id,
-    s.document_title,
-    s.chunk_index,
-    s.heading_path,
-    s.content,
-    s.char_start,
-    s.char_end,
-    coalesce(sem.similarity, 0) as similarity,
-    coalesce(kw.text_rank, 0) as text_rank,
-    coalesce(1.0 / (60 + sem.rank), 0) + coalesce(1.0 / (60 + kw.rank), 0) as score
-  from scoped s
-  left join semantic sem on sem.id = s.id
-  left join keyword kw on kw.id = s.id
-  where (sem.id is not null or kw.id is not null)
-    and (coalesce(sem.similarity, 0) >= min_similarity or kw.id is not null)
-  order by score desc
+    c.id as chunk_id,
+    c.document_id,
+    d.title as document_title,
+    c.chunk_index,
+    c.heading_path,
+    c.content,
+    c.char_start,
+    c.char_end,
+    f.similarity,
+    f.text_rank,
+    f.score
+  from fused f
+  join public.document_chunks c on c.id = f.id
+  join public.documents d on d.id = c.document_id
+  order by f.score desc
   limit least(match_count, 20);
 $$;
 

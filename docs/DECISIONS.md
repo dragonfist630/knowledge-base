@@ -262,6 +262,131 @@ PostgREST-visible), so it didn't need regenerating.
 More entries land as Phase 1+ makes their own calls (RLS pattern, chunking
 numbers, hybrid retrieval, etc.).
 
+### D1.6 — `documents.updated_at` was bumping on pipeline-internal writes, fixed
+
+An external review flagged that `set_updated_at()` was unconditional, so a
+status-only write from the indexing pipeline (`index_status`, `chunk_count`,
+`indexed_at` — everything `replace_document_chunks` sets on success) bumped
+`documents.updated_at` exactly like a real user edit. Reproduced directly:
+a status-only `update` on a freshly-seeded row bumped `updated_at` even
+though `title`/`content`/`tags` were untouched. This wasn't yet visible in
+the shipped tests because nothing calls `replace_document_chunks` until
+Phase 4 — but once indexing starts flipping `index_status` automatically,
+every reindex would have made a document look "just edited" in any
+`updated_at`-sorted list (`documents_user_updated_idx` exists specifically
+for that ordering), and `conversations.updated_at` needs the opposite
+behavior — Phase 6 (`docs/…` not yet written) intends "touch
+`conversations.updated_at`" on every finished chat turn purely to reorder
+the conversation list by recency, independent of any title change.
+
+Fixed by splitting the previously-shared `set_updated_at()` trigger
+function in two instead of making it row/table-aware: `documents` now uses
+a new `set_documents_updated_at()` that only bumps when
+`(title, content, tags)` actually changed (the exact fix the original
+brief called for); `conversations` keeps the original `set_updated_at()`,
+unconditional, unchanged, matching the "touch on any update" semantics the
+chat-turn flow will rely on.
+
+Added `supabase/tests/updated_at_trigger.test.sql` (3 pgTAP assertions):
+a status-only update doesn't bump `documents.updated_at`, a real content
+edit does, and `conversations.updated_at` still bumps unconditionally.
+Note the test uses a sentinel timestamp (`update ... set updated_at =
+'2020-01-01'` first, then check whether it moved away from that) instead
+of `pg_sleep()` + comparing against `now()`: pgTAP wraps the whole test in
+one `begin`/`rollback`, and `now()` is frozen at transaction start for the
+entire transaction, so `pg_sleep()` never actually advances it — a
+timestamp-ordering check across the sleep would have silently never been
+able to fail, which is itself a trap worth flagging for future trigger
+tests in this file. Verified the regression test fails (only assertion 1,
+the other two still pass) against the original unconditional function, and
+all 3 pass against the fix, from a fresh migration apply. `rls_isolation.
+test.sql` re-run unaffected: still 6/6.
+
+### D1.7 — `match_document_chunks` wasn't using the HNSW index; fixed, and the first fix attempt still wasn't enough
+
+An external review flagged that the `scoped` CTE in `match_document_chunks`
+was referenced three times (once each in `semantic`, `keyword`, and the
+final join), which PG12+ materializes — the planner sorted the whole
+materialized set for the semantic branch instead of probing
+`document_chunks_embedding_hnsw`. Confirmed with `EXPLAIN`: the ranking
+step showed `Sort Key: (embedding <=> $n)` over a `CTE Scan`, not an index
+scan.
+
+**First attempt (incomplete):** gave `semantic` and `keyword` their own CTE
+each, no longer sharing `scoped`, matching the brief's original suggested
+fix. This removes the *forced materialization*, but at 60k rows across 10
+seeded users, `EXPLAIN` still showed the semantic branch doing
+`Sort Key: (embedding <=> $n)` over a `Bitmap Heap Scan`, not an index scan.
+The CTE wasn't the only thing blocking it: `filter_tags` lives on
+`documents`, not `document_chunks`, so applying it means joining
+`documents` into the same subquery as the `order by ... limit`. Once that
+join is present, Postgres plans join-then-sort instead of an index-driven
+top-k scan, independent of any CTE sharing. This means the *brief's own*
+originally-suggested "just split the CTE" fix would not actually have
+solved the problem either — verified by testing that exact structure at
+scale before accepting it.
+
+**Actual fix:** `semantic_raw`/`keyword_raw` now run their
+`order by ... limit` against `document_chunks` alone, filtered only by
+columns it already has (`user_id`, `document_id` — both index-friendly,
+neither needs a join). `filter_tags` is applied in a second stage
+(`semantic`/`keyword`), joining `documents` against the already-narrowed
+candidate set. The raw stage over-fetches (`match_count * 8` instead of
+`* 4`) to bound the recall cost of filtering after the fact — a document
+that would rank in the true top N but falls outside the wider over-fetch
+window before the tag filter runs could be missed. This only matters when
+`filter_tags` is actually passed (the uncommon path per the brief); the
+common no-tag-filter call is unaffected and fully index-driven.
+
+Verification, in order:
+1. Reproduced the original bug on a fresh migration with `EXPLAIN` before
+   changing anything.
+2. First fix (per-branch CTEs, no join restructuring) still failed the same
+   `EXPLAIN` check at 60k rows / 10 users — caught this before accepting it
+   as done, rather than trusting that removing the shared CTE alone was
+   sufficient just because it matched the brief's suggested query.
+3. Seeded 60,000 chunks across 10 users (one user's chunks are ~10% of the
+   table, so the ownership filter is realistically selective — a 100%-
+   selective single-tenant table never picks the index over a sort
+   regardless of query shape, which is why the very first small-scale check
+   in this file's earlier draft wasn't a valid test).
+4. `EXPLAIN` on the actual fixed function body (parameters substituted as
+   literals, matching how a real call is planned — a `WITH params AS
+   (SELECT $1 AS query_embedding, ...)` reconstruction was tried first and
+   gave a false negative: pulling `query_embedding` through a joined CTE
+   column, instead of referencing it directly the way a real SQL-function
+   parameter behaves, defeats the index by itself and is not representative
+   of the deployed function) now shows
+   `Index Scan using document_chunks_embedding_hnsw ... Order By: (embedding <=> $n)`
+   for the semantic branch.
+5. `EXPLAIN ANALYZE` on the real deployed function, same 60k-row database,
+   swapping only the function body between the original `scoped`-CTE
+   version and the fix: original averaged ~50–60ms per call, the fix
+   averaged ~28–29ms (5 runs each). Forcing `enable_indexscan/bitmapscan =
+   off` on the fixed function raised its time to ~94ms, confirming the
+   ~2x win is coming from the index, not noise. The margin is expected to
+   widen well beyond 2x at real production chunk counts (tens/hundreds of
+   thousands of chunks per user) — an HNSW index's advantage over a sort
+   grows with table size, so a 60k-row/10-user sandbox understates it.
+6. Added `supabase/tests/match_document_chunks.test.sql` (6 pgTAP
+   assertions covering `filter_tags` match/no-match, `filter_document_ids`
+   own/other-user, `match_count=0`, and the no-filter path) — none of this
+   was covered by `rls_isolation.test.sql`, which only checks that a
+   different user gets zero rows, not that filters work correctly for a
+   user's own data. All 6 pass against the fix. Re-ran `rls_isolation.
+   test.sql` and `updated_at_trigger.test.sql` too: still 6/6 and 3/3.
+
+Note for future retrieval work: while building this fix's test harness, a
+first attempt at the "other user's document" filter_document_ids assertion
+produced a false positive (8 rows instead of the expected 0) because the
+test itself fetched the other user's document id through a query that RLS
+silently zeroed out (`select array_agg(id) from documents where user_id <>
+...`, run as the first user, returns `NULL` under RLS, and `NULL` means
+"no filter" to this function) — not a bug in the function. Caught by
+cross-checking with the id fetched a different way. Worth remembering when
+writing any test that constructs an "other user's data" fixture under RLS:
+fetch it before impersonating, not after.
+
 ## Phase 2
 
 ### D2.1 — Provider preset table corrected against current vendor docs, not the brief
