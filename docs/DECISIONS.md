@@ -218,5 +218,46 @@ db:reset && pnpm db:test && pnpm db:types` is expected to reproduce the
 same result — this migration and test aren't shaped around the workaround,
 the workaround was shaped to test them faithfully.
 
+### D1.5 — Independent re-validation caught two more real issues, both fixed
+
+After the initial Phase 1 push, ran a second, independent validation pass
+specifically to check "is this actually done" rather than trust the first
+pass: fresh `git clone` of the pushed repo (byte-for-byte diffed against
+the working copy first), a brand-new Postgres database, migration applied
+from that clean clone, pgTAP re-run from scratch — all to rule out any
+state left over from authoring the migration in the first place.
+
+That pass also went further than Gate 1's literal bar and used two real
+external checks instead of hand-rolled ones:
+
+- `supabase db lint --db-url ... --schema public` (the CLI's own
+  `plpgsql_check`-backed static analyzer, works without Docker) against
+  all four functions: 0 issues.
+- Looked up Supabase's actual Security Advisor rule
+  (`0011_function_search_path_mutable`, WARN level) instead of guessing
+  what it checks, then queried `pg_proc.proconfig` directly. This caught a
+  real gap `db lint` doesn't check for: `set_updated_at` and
+  `replace_document_chunks` had no pinned `search_path`, which the real
+  Security Advisor would flag exactly like it does on live Supabase
+  projects. Fixed by adding `set search_path = public` /
+  `set search_path = public, extensions` to both (matching what
+  `match_document_chunks`/`usage_summary` already had — the vector/fts
+  operators need `extensions` on the path, so `search_path = ''` isn't an
+  option here the way Supabase's own docs suggest as the default fix).
+
+Also added `create index messages_user_idx on public.messages (user_id);`.
+Every other table's `user_id`-filtered RLS select policy had a covering
+index; `messages` was the one exception, which the Performance Advisor's
+`unindexed_foreign_keys` check would flag. Not in the brief's original
+index list, but "adjust only if you have a reason, and write it down"
+covers this — the reason is the inconsistency itself, once we had cause to
+go looking for it.
+
+Re-ran the full suite after both fixes (fresh DB, migration, pgTAP, lint):
+still 6/6 pgTAP assertions, still 0 `db lint` issues, `pg_proc.proconfig`
+now shows a pinned `search_path` on all four functions, and the generated
+`database.types.ts` is byte-identical (neither fix changes anything
+PostgREST-visible), so it didn't need regenerating.
+
 More entries land as Phase 1+ makes their own calls (RLS pattern, chunking
 numbers, hybrid retrieval, etc.).

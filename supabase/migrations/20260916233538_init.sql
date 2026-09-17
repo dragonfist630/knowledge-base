@@ -81,6 +81,7 @@ create table public.messages (
 );
 
 create index messages_conversation_created_idx on public.messages (conversation_id, created_at);
+create index messages_user_idx on public.messages (user_id);
 
 -- ai_usage_events ----------------------------------------------------------
 
@@ -107,6 +108,7 @@ create index ai_usage_user_created_idx on public.ai_usage_events (user_id, creat
 create or replace function public.set_updated_at()
 returns trigger
 language plpgsql
+set search_path = public
 as $$
 begin
   new.updated_at = now();
@@ -293,6 +295,7 @@ create or replace function public.replace_document_chunks(
 ) returns boolean
 language plpgsql
 security invoker
+set search_path = public, extensions
 as $$
 declare
   v_current_hash text;
