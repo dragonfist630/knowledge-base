@@ -115,3 +115,59 @@ control byte inside a valid string literal is invisible to `tsc`,
 `eslint`, and a test suite that only checks behavior. Fixed, and added a
 small automated check for this exact class of thing (D3.7) rather than
 relying on a person noticing an odd `file` classification next time.
+
+## Phase 4 — indexing pipeline (chunk -> embed -> store)
+
+Asked for the real chunk -> embed -> atomically-store pipeline the
+previous three phases had deliberately deferred (`IndexingQueue` was a
+Phase 3 stub that only remembered the latest job per document and never
+processed anything — D3.2). Built in dependency order: the pure
+`@kb/rag-core` chunker first (markdown-aware, token-budgeted via
+`gpt-tokenizer`, offset-tracked back to the original content — D4.1),
+then the real `p-queue`-backed `IndexingQueue` (concurrency 2, per-
+document "latest job wins" — D4.2), then `IndexingService` as the
+processor, late-bound in to avoid a circular dependency between the two
+(D4.2), then a Gate 4 e2e suite exercising the whole thing end to end
+against the same real Postgres+RLS+PostgREST harness Gate 3 already
+built (D4.5).
+
+One design question turned out to be a real architectural dead end
+rather than just an implementation detail: the brief's own trade-off
+note asked for "a startup sweep that re-enqueues stuck documents," since
+the in-process queue loses everything on restart. A literal boot-time
+sweep needs a query that can see every user's stuck documents at once —
+which this app structurally cannot do without a service-role client, and
+this app has deliberately never had one (RLS is the only authorization
+boundary anywhere in apps/api, reaffirmed as recently as Phase 3's D3.6).
+Rather than quietly adding a privileged credential just to satisfy a
+resiliency nice-to-have, the sweep instead runs lazily and per-user, using
+each request's own already-verified JWT to resume that same user's own
+stuck documents the next time they touch the API (D4.4) — a real,
+honestly-documented trade-off (a document whose owner never returns
+stays stuck) rather than a security shortcut.
+
+A subtler correctness bug surfaced only once the chunker was tested
+against an intentionally oversized fenced code block: the greedy packer
+was deciding whether a piece fit the token budget by summing each
+piece's own token count in isolation, but the actual chunk text also
+includes the separator between packed pieces (a blank line, etc.), and
+BPE token merges can occur across a piece boundary too — both meant the
+REAL token count of a finished chunk could end up one or more tokens
+over the budget even though the bookkeeping said it fit (a failing test
+caught this directly: 601 tokens where the hard max was 600). Fixed by
+checking the actual candidate slice's real token count instead of a
+running sum, plus a binary-search safety net on the overlap step for the
+same underlying reason.
+
+Also rewrote part of Phase 3's own `documents.e2e-spec.ts`: its CRUD
+test used to observe indexing by reaching into the running app's
+`IndexingQueue` and calling a test-only `peek()` method, which was fine
+when nothing was actually consuming the queue (Phase 3) but becomes
+meaningless once a fast mock embedder actually processes jobs almost
+instantly — by the time a test could call `peek()`, the job it wanted to
+observe had usually already finished. Rewrote those assertions to poll
+the same HTTP-visible fields (`indexStatus`/`chunkCount`/`indexedAt`) a
+real client would see instead (D4.5), which is a strictly stronger test
+than the one it replaced: it now proves a tags-only edit leaves
+`indexedAt` completely unchanged, not just that an internal hash "looks"
+unchanged.

@@ -29,16 +29,55 @@ export class DocumentsService {
     private readonly indexingQueue: IndexingQueue,
   ) {}
 
-  list(auth: AuthContext, query: DocumentListQuery): Promise<ListDocumentsResult> {
+  async list(auth: AuthContext, query: DocumentListQuery): Promise<ListDocumentsResult> {
+    await this.resumeStuckIndexing(auth);
     return this.repository.list(auth.db, query);
   }
 
   async getById(auth: AuthContext, id: string): Promise<DocumentDetail> {
+    await this.resumeStuckIndexing(auth);
     const document = await this.repository.findById(auth.db, id);
     if (!document) {
       throw new NotFoundException("Document not found.");
     }
     return document;
+  }
+
+  /**
+   * Crash recovery for IndexingQueue, which is in-process and in-memory
+   * (see indexing.queue.ts's docstring): if the API restarts while a
+   * document is 'pending' or 'indexing', that job is gone and nothing will
+   * ever pick it back up on its own.
+   *
+   * A boot-time sweep can't fix this by itself: RLS means any query only
+   * ever sees ONE user's documents under THAT user's JWT, and at boot
+   * there is no user's JWT to run it with — the only way around that would
+   * be a service-role client, which this app deliberately has nowhere
+   * (see docs/DECISIONS.md; D3.6 exists specifically because a forged
+   * service-role token is dangerous). So instead of a boot-time sweep,
+   * this runs lazily, scoped to whichever user is making a request right
+   * now, using THEIR OWN already-verified JWT — which never sees, and
+   * never needs to see, any other user's documents.
+   *
+   * Re-enqueuing a document that's already actively processing in this
+   * same process is a safe, cheap no-op (IndexingQueue.isActive), so this
+   * is fine to call on every list()/getById(). See docs/DECISIONS.md Phase
+   * 4 for the full trade-off writeup, including the one residual gap this
+   * leaves: a document whose owner never makes another request stays
+   * stuck until they do.
+   */
+  private async resumeStuckIndexing(auth: AuthContext): Promise<void> {
+    let stuck: { id: string; content_hash: string }[];
+    try {
+      stuck = await this.repository.findStuckIndexing(auth.db);
+    } catch {
+      // Best-effort only — a sweep failure must never break a normal read.
+      return;
+    }
+    for (const doc of stuck) {
+      if (this.indexingQueue.isActive(doc.id)) continue;
+      this.indexingQueue.enqueue({ documentId: doc.id, contentHash: doc.content_hash, userJwt: auth.jwt });
+    }
   }
 
   async create(auth: AuthContext, input: DocumentCreate): Promise<DocumentDetail> {

@@ -1,4 +1,5 @@
 import { Injectable, Logger } from "@nestjs/common";
+import PQueue from "p-queue";
 
 export interface IndexingJob {
   documentId: string;
@@ -6,36 +7,99 @@ export interface IndexingJob {
   userJwt: string;
 }
 
+export type IndexingProcessor = (job: IndexingJob) => Promise<void>;
+
 /**
- * Phase 3 owns the shape of this queue (documents.service enqueues into it
- * on create/update/reindex) but NOT its processing: the actual
- * chunk -> embed -> replace_document_chunks pipeline needs
- * packages/rag-core's chunker, which doesn't exist until Phase 4. This is a
- * deliberate phase boundary, not an oversight — see docs/DECISIONS.md Phase
- * 3 (D3.2). Until Phase 4 lands, a newly created/updated document sits in
- * index_status='pending' (set by documents.service itself, not by a
- * consumer here) and stays there; nothing in this class contacts an AI
- * provider or the database.
+ * In-process, concurrency-limited job queue for the chunk -> embed ->
+ * replace_document_chunks pipeline (IndexingService, Phase 4). Two
+ * invariants, both load-bearing:
  *
- * The real Phase 4 implementation replaces this class's body (same public
- * `enqueue` signature — job carries { documentId, contentHash, userJwt } —
- * so documents.service doesn't change): an in-process p-queue keyed by
- * document ID, concurrency 2, latest-job-wins per document.
+ * 1. Concurrency 2 globally (via p-queue) — at most two documents are ever
+ *    being indexed at the same time, so a burst of saves doesn't hammer
+ *    the embedding provider or the DB.
+ * 2. Per-document serialization with "latest job wins": a document ID
+ *    occupies exactly one p-queue slot for the ENTIRE time it has work
+ *    pending, not one slot per enqueue. A second `enqueue()` for a
+ *    document that's already running doesn't start a second task — it
+ *    just replaces `pendingByDocument.get(documentId)`, and the running
+ *    task loops to pick that newer job up once its current pass finishes.
+ *    An in-flight embed/DB call is never cancelled (that's not something
+ *    you can safely do to a network call mid-flight); instead, a stale
+ *    job for the same document simply never gets its own processor run,
+ *    because by the time the loop checks again, `pendingByDocument` only
+ *    remembers the newest one. `replace_document_chunks`'s own
+ *    content_hash guard (see supabase/migrations) is the second, belt-and-
+ *    suspenders layer against a slow stale write clobbering a newer one.
+ *
+ * The processor itself is late-bound via `setProcessor()` rather than
+ * constructor-injected, to avoid a circular DI dependency: IndexingService
+ * needs this queue injected (to register itself as the processor), and
+ * this queue would need IndexingService injected to call it — Nest can't
+ * construct either first. `setProcessor()` is called from
+ * IndexingService's constructor instead, which runs after both classes
+ * exist. See docs/DECISIONS.md Phase 4.
  */
 @Injectable()
 export class IndexingQueue {
   private readonly logger = new Logger(IndexingQueue.name);
-  private readonly pending = new Map<string, IndexingJob>();
+  private readonly queue = new PQueue({ concurrency: 2 });
+  private readonly pendingByDocument = new Map<string, IndexingJob>();
+  private readonly active = new Set<string>();
+  private processor: IndexingProcessor | undefined;
 
-  enqueue(job: IndexingJob): void {
-    this.pending.set(job.documentId, job);
-    this.logger.debug(
-      `Indexing queued for document ${job.documentId} (contentHash=${job.contentHash}) — no consumer yet, lands in Phase 4.`,
-    );
+  /** Late-bound by IndexingService's constructor — see the class docstring. */
+  setProcessor(processor: IndexingProcessor): void {
+    this.processor = processor;
   }
 
-  /** Test/inspection hook only — the real Phase 4 queue won't need this. */
-  peek(documentId: string): IndexingJob | undefined {
-    return this.pending.get(documentId);
+  enqueue(job: IndexingJob): void {
+    this.pendingByDocument.set(job.documentId, job);
+    if (this.active.has(job.documentId)) {
+      // A p-queue task for this document is already running (or scheduled)
+      // and will pick up this newer job when its loop checks again.
+      return;
+    }
+    this.active.add(job.documentId);
+    void this.queue.add(() => this.runForDocument(job.documentId));
+  }
+
+  private async runForDocument(documentId: string): Promise<void> {
+    try {
+      for (;;) {
+        const job = this.pendingByDocument.get(documentId);
+        this.pendingByDocument.delete(documentId);
+        if (!job) break;
+
+        if (!this.processor) {
+          this.logger.warn(`No processor registered yet — dropping indexing job for document ${documentId}.`);
+          break;
+        }
+
+        try {
+          await this.processor(job);
+        } catch (error) {
+          // The processor (IndexingService) is responsible for recording a
+          // failure against the document itself (index_status='failed' +
+          // index_error). This catch is only a backstop so a bug in that
+          // error handling can't take down the whole queue's event loop.
+          this.logger.error(
+            `Indexing job for document ${documentId} threw an unhandled error.`,
+            error instanceof Error ? error.stack : error,
+          );
+        }
+      }
+    } finally {
+      this.active.delete(documentId);
+    }
+  }
+
+  /** True while a job for this document currently holds a queue slot (running, or about to). Test/inspection hook. */
+  isActive(documentId: string): boolean {
+    return this.active.has(documentId);
+  }
+
+  /** Resolves once every currently queued/running job has settled. Test/inspection hook. */
+  async onIdle(): Promise<void> {
+    await this.queue.onIdle();
   }
 }

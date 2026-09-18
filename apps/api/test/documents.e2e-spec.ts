@@ -4,8 +4,8 @@ import type { TestingModule } from "@nestjs/testing";
 import request from "supertest";
 
 import { AppModule } from "../src/app.module.js";
-import { IndexingQueue } from "../src/indexing/indexing.queue.js";
 import { mintJwt } from "./e2e/jwt.js";
+import { waitFor } from "./e2e/wait-for.js";
 
 /**
  * Gate 3 e2e — real HTTP requests against a real Postgres+RLS+PostgREST
@@ -65,14 +65,25 @@ describe("Documents (e2e)", () => {
     expect(createRes.body.indexStatus).toBe("pending");
     const docId: string = createRes.body.id;
 
-    // content_hash isn't exposed on the DTO (see documents.repository.ts's
-    // SUMMARY/DETAIL columns), so this reaches into the same in-process
-    // IndexingQueue instance the running app uses to observe it directly —
-    // documents.service only enqueues a new job when the hash actually
-    // changes (see documents.service.ts / documents.service.spec.ts).
-    const indexingQueue = app.get(IndexingQueue);
-    const hashAfterCreate = indexingQueue.peek(docId)?.contentHash;
-    expect(hashAfterCreate).toBeTruthy();
+    const getDoc = () =>
+      request(app.getHttpServer())
+        .get(`/documents/${docId}`)
+        .set("Authorization", authed(userA.jwt))
+        .expect(200)
+        .then((r) => r.body);
+
+    // The real indexing pipeline (Phase 4) runs off-request, inside
+    // IndexingQueue — poll the document's own HTTP-visible status rather
+    // than reaching into internal queue state (content_hash isn't exposed
+    // on the DTO at all — see documents.repository.ts's SUMMARY columns).
+    // The mock embedder (this env's default) is fast and needs no network,
+    // so this settles quickly in practice.
+    const readyAfterCreate = await waitFor(getDoc, (doc) => doc.indexStatus === "ready", {
+      label: "index after create",
+    });
+    expect(readyAfterCreate.chunkCount).toBeGreaterThan(0);
+    expect(readyAfterCreate.indexedAt).toBeTruthy();
+    const indexedAtAfterCreate: string = readyAfterCreate.indexedAt;
 
     // Read
     const getRes = await request(app.getHttpServer())
@@ -95,18 +106,29 @@ describe("Documents (e2e)", () => {
       .send({ tags: ["ops", "runbook", "deploys"] })
       .expect(200);
     expect(tagsUpdateRes.body.tags.sort()).toEqual(["deploys", "ops", "runbook"]);
-    // Tags-only: no new job enqueued at all, so the queue still shows
-    // exactly the hash that was there right after creation.
-    expect(indexingQueue.peek(docId)?.contentHash).toBe(hashAfterCreate);
+    // Tags-only: no new job enqueued at all (content_hash didn't change —
+    // see computeContentHash / documents.service.spec.ts), so the document
+    // is still exactly as indexed right after creation: same status, same
+    // indexedAt, same chunk_count.
+    expect(tagsUpdateRes.body.indexStatus).toBe("ready");
+    expect(tagsUpdateRes.body.indexedAt).toBe(indexedAtAfterCreate);
+    expect(tagsUpdateRes.body.chunkCount).toBe(readyAfterCreate.chunkCount);
 
-    // A title/content change DOES re-trigger indexing (hash changes).
+    // A title/content change DOES re-trigger indexing (hash changes) — ends
+    // back at 'ready', with a NEW indexedAt, reflecting the SECOND version.
     const contentUpdateRes = await request(app.getHttpServer())
       .patch(`/documents/${docId}`)
       .set("Authorization", authed(userA.jwt))
       .send({ content: "Step one. Step two. Step three." })
       .expect(200);
     expect(contentUpdateRes.body.content).toBe("Step one. Step two. Step three.");
-    expect(indexingQueue.peek(docId)?.contentHash).not.toBe(hashAfterCreate);
+
+    const readyAfterUpdate = await waitFor(
+      getDoc,
+      (doc) => doc.indexStatus === "ready" && doc.indexedAt !== indexedAtAfterCreate,
+      { label: "index after content update" },
+    );
+    expect(readyAfterUpdate.chunkCount).toBeGreaterThan(0);
 
     // Delete
     await request(app.getHttpServer()).delete(`/documents/${docId}`).set("Authorization", authed(userA.jwt)).expect(204);

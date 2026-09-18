@@ -123,6 +123,19 @@ export class DocumentsRepository {
     return data;
   }
 
+  /**
+   * This caller's own documents currently sitting in 'pending' or
+   * 'indexing' — used for the crash-recovery sweep (documents.service.ts's
+   * resumeStuckIndexing / see docs/DECISIONS.md Phase 4). RLS means this
+   * can only ever return the requesting user's own rows, same as every
+   * other method here.
+   */
+  async findStuckIndexing(db: SupabaseClient<Database>): Promise<Pick<DocumentRow, "id" | "content_hash">[]> {
+    const { data, error } = await db.from("documents").select("id, content_hash").in("index_status", ["pending", "indexing"]);
+    if (error) throw error;
+    return data ?? [];
+  }
+
   async insert(
     db: SupabaseClient<Database>,
     values: Pick<Database["public"]["Tables"]["documents"]["Insert"], "title" | "content" | "tags" | "content_hash">,

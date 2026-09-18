@@ -800,3 +800,201 @@ tab/newline/carriage-return and fails the build if one is found — so this
 exact class of bug (valid, compiling, passing-every-existing-test, but
 literally not text) gets a real automated check instead of depending on
 someone noticing `file` or `grep` complain about a specific source file.
+
+## Phase 4
+
+### D4.1 — Chunker: markdown-aware, token-budgeted, offset-tracked, pure
+
+`packages/rag-core/src/chunker.ts`'s `chunkDocument(title, content, opts)`
+is the first real content of `@kb/rag-core` (Phase 0 only scaffolded the
+package). Pure and framework-free — no I/O, no Nest, no Supabase client —
+so it unit-tests in isolation and is reusable from a future worker
+process without dragging apps/api along.
+
+Pipeline: normalize line endings (`\r\n`/`\r` -> `\n`) while keeping an
+index map back to the ORIGINAL string, so every chunk's `charStart`/
+`charEnd` describe the document exactly as it was saved, not the
+normalized copy — verified with a dedicated CRLF round-trip test, not
+just an LF one. Parse blocks (ATX headings H1-H6, fenced code, GFM
+tables, plain text runs) with a heading stack producing each block's
+`headingPath` ("Document Title > H1 > H2 > ..."); the title is
+deliberately the root of every path, matching `computeContentHash`'s own
+title-feeds-the-embedding rationale (documents.service.ts) — a title-only
+edit already changes the hash, and now it also changes every chunk's
+heading path text, so the two stay conceptually consistent. Code blocks
+and tables are atomic (never split) unless a single one alone exceeds
+`RAG_CHUNK_MAX_TOKENS`, in which case it's split by line as a last
+resort — both behaviors have their own test. Everything else recursively
+splits blank-line -> newline -> sentence-end -> whitespace, only as far
+as needed to get under budget, then greedily packs back up to
+`RAG_CHUNK_TOKENS` (450 soft), capped at `RAG_CHUNK_MAX_TOKENS` (600
+hard); a heading-path change always forces a new chunk, so one chunk
+never straddles two sections.
+
+Real token counts throughout, via `gpt-tokenizer`'s `countTokens` — not
+a character-count approximation — because the whole point of the budget
+is to bound what an embedding call (and eventually a chat prompt) will
+actually cost/accept. One subtlety that cost a failing test before it was
+fixed: packing decisions can't just sum each piece's own token count in
+isolation, because the separator text between two packed pieces (a blank
+line, etc.) and BPE merges across a piece boundary both still cost real
+tokens once they're part of one contiguous chunk. `packPieces` checks the
+token count of the ACTUAL candidate slice (`normalizedText.slice(start,
+candidateEnd)`), not a running sum, and the overlap step (next paragraph)
+has its own binary-search safety net for the same reason — both are
+covered by "never exceeds the hard max, even with overlap applied".
+
+Consecutive chunks under the SAME heading path carry `RAG_CHUNK_OVERLAP_
+TOKENS` (60) of trailing context from the predecessor, cut at a sentence
+boundary where one is found within budget; overlap never crosses a
+heading boundary (a new section starts clean) and is shrunk — down to
+zero if necessary — so a chunk plus its overlap still never exceeds the
+hard max. A trailing chunk under `minTrailingTokens` (80) merges into its
+predecessor rather than being left as a tiny orphan; this runs at every
+heading-path boundary, not only at the very end of the document (several
+tiny trailing chunks in a row cascade-merge, walking backward), and never
+merges across a heading boundary either.
+
+All of the brief's specified cases are covered in `chunker.spec.ts`:
+empty document (0 chunks), short document (exactly 1), headings
+propagating into `headingPath`, a code block never splitting (plus the
+oversized-block line-split fallback as its own case), char-offset
+round-tripping (LF and CRLF), overlap actually appearing in the next
+chunk, the hard max never being exceeded, small-trailing-chunk merging,
+and chunks never mixing content from two different heading paths.
+
+### D4.2 — `IndexingQueue`: p-queue, concurrency 2, per-document "latest job wins"
+
+Replaced the Phase 3 stub (D3.2) with the real implementation the brief
+specified: an in-process `p-queue` (concurrency 2 globally) keyed by
+document ID. The subtlety is what "keyed by document ID" has to mean once
+jobs can actually take real time (an HTTP call to an embedding provider,
+not an instant mock): a document ID occupies exactly ONE p-queue slot for
+the entire time it has work pending, not one slot per `enqueue()` call.
+`enqueue()` while a document's slot is already active just replaces
+`pendingByDocument.get(documentId)` with the newer job; the running task
+loops (`runForDocument`) and picks that up once its current pass
+finishes, rather than a second task being scheduled. An in-flight
+embed/DB call is never cancelled — there's no safe way to cancel a
+network call mid-flight — so "latest job wins" means a stale intermediate
+job for the same document simply never gets its own processor run, not
+that an in-flight one gets interrupted. `replace_document_chunks`'s own
+`content_hash` guard (unchanged since Phase 1) is the second,
+belt-and-suspenders layer in case a slow stale write somehow still lands
+after a newer one.
+
+The processor itself (`IndexingService`) is late-bound via
+`queue.setProcessor()` called from `IndexingService`'s own constructor
+(via `onModuleInit`), not constructor-injected into the queue — Nest
+can't construct `IndexingQueue` and `IndexingService` if each needs the
+other as a constructor argument. This is the same late-binding pattern
+the brief's own circular-DI guidance describes, and avoids `forwardRef()`
+entirely. Note this means `IndexingService` is never actually injected by
+anything else in the app — it's listed in `IndexingModule`'s `providers`
+purely so Nest constructs it (and runs its `onModuleInit`) at boot; Nest
+eagerly instantiates every provider in a module's `providers` array
+regardless of whether anything else injects it, which is exactly what's
+relied on here.
+
+### D4.3 — Indexing pipeline error handling: `AiError` messages are safe to show; everything else isn't
+
+`IndexingService.process()`'s catch-all writes `index_error`, which IS
+user-facing (`documents.repository.ts` exposes it on the DTO). `AiError`
+(`@kb/ai`, Phase 2) is documented as deliberately safe to surface —
+adapters must never leak a raw SDK/HTTP error through it — so an
+`AiError`'s own `.message` is used verbatim. Anything else (a Postgres
+error, a bug) might contain internal detail that shouldn't reach a user,
+so it's logged in full via Nest's `Logger` (server-side only) and
+replaced with a generic "Indexing failed unexpectedly. Try reindexing."
+before it's written to the row. Both `markFailed` and the new
+`markIndexing` (set right before processing starts, giving `index_status`
+a real, visible 'indexing' state instead of jumping straight from
+'pending' to 'ready'/'failed') are guarded by `content_hash`, the same
+principle as `replace_document_chunks`'s own guard: a stale write for an
+already-superseded version of the document is a silent no-op, never a
+clobber.
+
+### D4.4 — No boot-time startup sweep: RLS makes one impossible without a service-role key, so recovery is lazy and per-user instead
+
+The brief's own trade-off note (an in-process queue loses all pending
+work on restart) called for "a startup sweep that re-enqueues documents
+stuck in pending/indexing." A literal boot-time, `OnApplicationBootstrap`
+sweep turns out to be impossible within this app's own architecture,
+not just inconvenient: every Supabase query in apps/api runs through a
+per-request client scoped to one user's JWT, because RLS is the only
+authorization boundary here — there is deliberately no service-role
+client anywhere in this app (reaffirmed as recently as D3.6, which exists
+specifically because a forged service-role-claiming JWT is dangerous). A
+sweep running at boot has no user's JWT to run as, and "find every
+stuck document across every user" is exactly the kind of cross-user query
+RLS exists to prevent from an ordinary client. The only way to make a
+literal boot-time sweep work would be to give apps/api a service-role
+client (or an equally privileged narrower role) — a real architecture
+change with real security implications, not something to reach for
+quietly just to tick off a resiliency nice-to-have.
+
+Instead, `DocumentsService.resumeStuckIndexing()` runs lazily, on every
+`list()` and `getById()` call, scoped to whichever user is making that
+request, using THEIR OWN already-verified JWT (`auth.jwt` — the exact
+same client `AuthGuard` already built for this request). It queries only
+that user's own `'pending'`/`'indexing'` documents (RLS-scoped, so it
+structurally cannot see anyone else's) and re-enqueues each one that
+isn't already active in this process's `IndexingQueue`
+(`queue.isActive()`), which is what makes it safe to call on every
+request rather than only after a detected crash — re-enqueuing a
+document that's already being processed right now is a cheap, correct
+no-op, not a duplicate side effect. In practice this means: any document
+stuck by a server restart gets automatically picked back up the next
+time its owner does essentially anything with their documents (opens
+their list, opens the document itself) — which for an interactive
+product is close to immediate. The one honestly-acknowledged residual
+gap: a document whose owner never makes another request stays stuck
+until they do. That's the trade-off actually being made here, and it's a
+significant improvement over "stays stuck forever, unconditionally,"
+without ever introducing a new privileged credential.
+
+### D4.5 — Gate 4 e2e: real pipeline end-to-end, deterministic failure injection via `overrideProvider`, not a hook in `@kb/ai`
+
+`documents.e2e-spec.ts`'s existing "full CRUD lifecycle" test previously
+asserted hash-gated indexing by reaching into the running app's
+`IndexingQueue` instance and calling a test-only `peek()` method (Phase
+3, since there was no real processing yet to observe any other way).
+That approach stops being meaningful once real processing exists:
+`peek()`'s "the latest job still queued for this document" becomes "not
+yet started," which is usually already empty by the time a test can
+check it, since the mock embedder finishes in milliseconds. Rewrote those
+assertions to poll the same HTTP-visible fields a real client would see
+(`GET /documents/:id`'s `indexStatus`/`chunkCount`/`indexedAt`) via a
+small `waitFor()` helper (`test/e2e/wait-for.ts`) — a tags-only update
+now asserts `indexedAt` is UNCHANGED (proving no job was enqueued, not
+just that the hash "looks" the same), and a content update asserts
+`indexedAt` changes and `indexStatus` returns to `'ready'`.
+
+Added `indexing.e2e-spec.ts` for the pipeline-specific cases the brief
+called for: a basic document's `chunkCount` matches calling
+`chunkDocument()` directly with the same title/content (i.e., the API's
+real output equals the pure function's real output, not just "some
+positive number"); two content updates fired back-to-back without
+waiting resolve to the SECOND update's content and chunk count (proving
+"latest job wins" end-to-end, not just at the queue's own unit level);
+and a forced embedding failure leaves the document `'failed'` with a
+non-null `indexError` while its OLD `chunkCount`/`indexedAt` are
+completely untouched (proving a failed reindex can never lose already-
+indexed content) and that a `'failed'` document (only) is eligible for
+`POST /documents/:id/reindex`.
+
+The forced failure needed a way to make embedding fail on demand,
+deterministically, for exactly one document, without touching
+`@kb/ai` itself just to add a test-only trigger. Solved with a small
+`ControllableEmbeddingModel` (test-file-local) that wraps the real
+`MockEmbeddingModel` and throws an `AiError` only when an embed() input
+contains a sentinel string, otherwise delegating straight through —
+installed via Nest's own `overrideProvider(EMBEDDING_MODEL).useValue(...)`
+on the test module, a standard, first-class Nest testing mechanism, not a
+production code change or a hidden test hook.
+
+Re-ran the full pipeline from a fresh clone after all of Phase 4's
+changes: `pnpm lint` / `typecheck` / `build` / `test` clean across every
+workspace (`@kb/rag-core` now has its own real test suite, matching the
+`@kb/shared`/`@kb/ai` pattern), and `apps/api`'s `pnpm test:e2e` at 15/15
+(12 in `documents.e2e-spec.ts`, 3 new in `indexing.e2e-spec.ts`).
