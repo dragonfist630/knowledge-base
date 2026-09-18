@@ -200,7 +200,13 @@ function assignHeadingPaths(blocks: Block[], title: string): PathedBlock[] {
   const trimmedTitle = title.trim();
 
   const currentPath = (): string | null => {
-    const parts = [...(trimmedTitle ? [trimmedTitle] : []), ...stack.map((s) => s.text)];
+    // A heading line with no actual title text after the hashes (e.g. a
+    // bare "## ", or "## ##") is malformed but still valid per HEADING_RE
+    // — it still counts as a section boundary (still pops/pushes the
+    // stack, still forces a new chunk on transition), it just contributes
+    // no text of its own to the path, so it's filtered out here rather
+    // than leaving a dangling empty segment like "Doc > Title > ".
+    const parts = [...(trimmedTitle ? [trimmedTitle] : []), ...stack.map((s) => s.text).filter((text) => text.length > 0)];
     return parts.length > 0 ? parts.join(" > ") : null;
   };
 

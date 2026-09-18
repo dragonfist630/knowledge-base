@@ -3,7 +3,7 @@ import type { OnModuleInit } from "@nestjs/common";
 import { chunkDocument } from "@kb/rag-core";
 import type { Chunk } from "@kb/rag-core";
 import { isAiError } from "@kb/ai";
-import type { EmbeddingModel } from "@kb/ai";
+import type { EmbeddingModel, TokenUsage } from "@kb/ai";
 import type { Database } from "@kb/shared";
 import type { SupabaseClient } from "@supabase/supabase-js";
 
@@ -31,6 +31,10 @@ import { EMBEDDING_MODEL } from "../ai/ai.module.js";
  * RLS as the user who owns the document — there is still no service-role
  * client anywhere in this app.
  */
+interface UsageResult extends TokenUsage {
+  latencyMs: number;
+}
+
 @Injectable()
 export class IndexingService implements OnModuleInit {
   private readonly logger = new Logger(IndexingService.name);
@@ -72,13 +76,13 @@ export class IndexingService implements OnModuleInit {
         overlapTokens: this.env.RAG_CHUNK_OVERLAP_TOKENS,
       });
 
-      const rpcChunks = chunks.length === 0 ? [] : await this.embedChunks(db, job, chunks);
+      const embedded = chunks.length === 0 ? undefined : await this.embedChunks(chunks);
 
       const wrote = await this.repository.replaceChunks(db, {
         documentId: job.documentId,
         contentHash: job.contentHash,
         embeddingModel: this.embeddingModel.descriptor.model,
-        chunks: rpcChunks,
+        chunks: embedded?.rpcChunks ?? [],
       });
 
       if (!wrote) {
@@ -86,32 +90,31 @@ export class IndexingService implements OnModuleInit {
           `Skipped writing chunks for document ${job.documentId} — a newer save already changed its content_hash.`,
         );
       }
+
+      // Recorded AFTER the write, and deliberately never allowed to affect
+      // its outcome (see recordUsageBestEffort): the embedding call already
+      // happened and already cost real tokens by this point regardless of
+      // whether the write above succeeded or was skipped as stale, so a
+      // hiccup in this purely-observational accounting insert must never
+      // discard chunks/embeddings that were otherwise computed successfully
+      // — see docs/DECISIONS.md Phase 4.
+      if (embedded) {
+        await this.recordUsageBestEffort(db, job, embedded.usage);
+      }
     } catch (error) {
       await this.handleFailure(db, job, error);
     }
   }
 
-  /** Embeds every chunk's input text and records the usage event. The embedding input is `${headingPath}\n\n${content}` — headingPath already starts with the document title (see @kb/rag-core's chunker), matching computeContentHash's own title-feeds-hashing rationale in documents.service.ts. */
-  private async embedChunks(db: SupabaseClient<Database>, job: IndexingJob, chunks: Chunk[]): Promise<RpcChunkInput[]> {
+  /** Embeds every chunk's input text and shapes the RPC payload. The embedding input is `${headingPath}\n\n${content}` — headingPath already starts with the document title (see @kb/rag-core's chunker), matching computeContentHash's own title-feeds-hashing rationale in documents.service.ts. */
+  private async embedChunks(chunks: Chunk[]): Promise<{ rpcChunks: RpcChunkInput[]; usage: UsageResult }> {
     const inputs = chunks.map((chunk) => `${chunk.headingPath ?? ""}\n\n${chunk.content}`.trim());
 
     const startedAt = Date.now();
     const { vectors, usage } = await this.embeddingModel.embed(inputs);
     const latencyMs = Date.now() - startedAt;
 
-    await this.repository.recordUsage(db, {
-      operation: "embedding",
-      provider: this.embeddingModel.descriptor.provider,
-      model: this.embeddingModel.descriptor.model,
-      promptTokens: usage.promptTokens,
-      completionTokens: usage.completionTokens,
-      totalTokens: usage.totalTokens,
-      isEstimated: usage.estimated,
-      latencyMs,
-      documentId: job.documentId,
-    });
-
-    return chunks.map((chunk, index) => ({
+    const rpcChunks = chunks.map((chunk, index) => ({
       chunk_index: chunk.chunkIndex,
       content: chunk.content,
       heading_path: chunk.headingPath,
@@ -122,6 +125,36 @@ export class IndexingService implements OnModuleInit {
       // `::extensions.vector` — see supabase/migrations/*_init.sql.
       embedding: `[${(vectors[index] ?? []).join(",")}]`,
     }));
+
+    return { rpcChunks, usage: { ...usage, latencyMs } };
+  }
+
+  /**
+   * Records the embedding usage event on a strict best-effort basis: a
+   * failure here is logged and swallowed, never rethrown. Usage accounting
+   * is an observational side effect of an embed() call that already
+   * happened — it must never be able to turn an otherwise-successful
+   * indexing pass into a 'failed' one. See docs/DECISIONS.md Phase 4.
+   */
+  private async recordUsageBestEffort(db: SupabaseClient<Database>, job: IndexingJob, usage: UsageResult): Promise<void> {
+    try {
+      await this.repository.recordUsage(db, {
+        operation: "embedding",
+        provider: this.embeddingModel.descriptor.provider,
+        model: this.embeddingModel.descriptor.model,
+        promptTokens: usage.promptTokens,
+        completionTokens: usage.completionTokens,
+        totalTokens: usage.totalTokens,
+        isEstimated: usage.estimated,
+        latencyMs: usage.latencyMs,
+        documentId: job.documentId,
+      });
+    } catch (error) {
+      this.logger.warn(
+        `Failed to record usage for document ${job.documentId} (indexing itself was not affected).`,
+        error instanceof Error ? error.stack : error,
+      );
+    }
   }
 
   private async handleFailure(db: SupabaseClient<Database>, job: IndexingJob, error: unknown): Promise<void> {

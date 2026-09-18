@@ -998,3 +998,79 @@ changes: `pnpm lint` / `typecheck` / `build` / `test` clean across every
 workspace (`@kb/rag-core` now has its own real test suite, matching the
 `@kb/shared`/`@kb/ai` pattern), and `apps/api`'s `pnpm test:e2e` at 15/15
 (12 in `documents.e2e-spec.ts`, 3 new in `indexing.e2e-spec.ts`).
+
+### D4.6 — Independent re-validation found a real bug: a usage-logging hiccup could discard a successful embed pass
+
+Asked, after Phase 4 was "done": "is this really done, without gaps or
+bugs?" — the same standard applied to Phase 3 (D3.6/D3.7), not just
+re-running the existing suite. From a fresh clone, re-read every new file
+adversarially against what it claims to do, wrote small standalone probe
+scripts to test specific hypotheses against the built output (not just
+reasoning about the code), and found one real bug plus one real,
+if minor, correctness bug, plus one real test-coverage gap:
+
+**The bug (confirmed with a standalone script before touching any
+code):** `IndexingService.embedChunks()` called
+`repository.recordUsage()` — an insert into `ai_usage_events`, a purely
+observational accounting record — INSIDE the same function, BEFORE
+returning the shaped chunk payload, and the whole call was inside
+`process()`'s one try block. A probe script instantiating the real
+`IndexingService` with a `recordUsage` that throws (simulating a
+transient DB hiccup) proved the exact failure mode: `embed()` succeeds,
+`recordUsage()` throws, and the job ends by calling `markFailed` — never
+even attempting `replace_document_chunks`. A perfectly good embed pass
+(the expensive, actually-important part) got thrown away and the
+document was marked `'failed'`, purely because a side-effect insert had
+a bad moment. This is a real resilience gap: the accounting write was
+treated as equally critical as the actual indexing write, when it
+obviously isn't — a user's document shouldn't fail to index because a
+usage-logging row didn't make it in.
+
+Fixed by moving `recordUsage` to run AFTER `replaceChunks` (not before),
+and wrapping it in its own try/catch that only logs a warning and never
+rethrows (`recordUsageBestEffort`) — usage is still recorded even when
+`replaceChunks` returns `false` (a stale write skip), since the `embed()`
+call already happened and already cost real tokens by that point
+regardless of what happens to the write afterward; a `recordUsage`
+failure can now never affect whether the document ends up `'ready'` or
+`'failed'`. Added `indexing.service.spec.ts` (a new file — Phase 4's
+`IndexingService`/`IndexingRepository` had zero unit-level tests before
+this, only e2e coverage) with the failing-probe scenario as a permanent
+regression test, plus checks for the correct call order, that usage is
+still recorded on a stale-write skip, and that a genuine `embed()`
+failure still correctly marks the document failed (proving the fix
+didn't accidentally swallow real failures too). Also extended
+`indexing.e2e-spec.ts`'s basic-doc test to actually query
+`ai_usage_events` (via a raw client scoped with the test user's own JWT,
+reading under real RLS) and assert a row lands there — this table wasn't
+being asserted on by any test at all before, despite `recordUsage` being
+a real, documented part of the pipeline.
+
+**The minor bug:** a markdown heading line with no title text after the
+hashes (`"## "`, or `"## ##"` — hashes on both sides, nothing between)
+is a malformed but valid ATX heading per `HEADING_RE`, and used to
+survive into `headingPath` as a dangling empty segment —
+`"Handbook > Doc Title > "` instead of `"Handbook > Doc Title"`.
+Confirmed with a probe script before fixing. Fixed by filtering
+empty-text segments out of the joined path in `assignHeadingPaths`
+(the heading still correctly acts as a section boundary — still pops/
+pushes the stack, still forces a new chunk — it just contributes no text
+of its own to the path). Added a regression test in `chunker.spec.ts`.
+
+**Also checked and ruled out**, so as not to leave them as open
+questions: whether embedding vectors with very small components
+(scientific notation, e.g. `1e-07`, which is how `Number.prototype.
+toString()` renders a sufficiently small float) would break
+`replace_document_chunks`'s `::extensions.vector` cast — confirmed via a
+direct `psql` probe that pgvector's text parser accepts exponential
+notation, so this was never actually a risk; and whether a heading-like
+line (`"# ..."`) INSIDE a fenced code block gets mistaken for a real
+heading — confirmed via a probe script that it does not (block parsing
+correctly treats fence interiors as opaque).
+
+Re-ran the full pipeline from a fresh clone after all fixes: `pnpm lint`
+/ `typecheck` / `build` / `test` clean across every workspace (`apps/api`
+now at 11 unit tests, up from 7, via the new `indexing.service.spec.ts`),
+and `pnpm test:e2e` at 15/15 again (same test count — the new
+`ai_usage_events` assertion was added to an existing test, not a new
+one).

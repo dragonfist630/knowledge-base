@@ -171,3 +171,33 @@ real client would see instead (D4.5), which is a strictly stronger test
 than the one it replaced: it now proves a tags-only edit leaves
 `indexedAt` completely unchanged, not just that an internal hash "looks"
 unchanged.
+
+Separately asked, once Phase 4 was "done": "is this really done, without
+gaps or bugs?" — same standard as Phase 3's third-and-fourth passes
+(D3.6, D3.7), not just re-running the suite that was written alongside
+the feature. From a fresh clone, re-read every new file adversarially
+and wrote small standalone probe scripts to test specific hypotheses
+against the actual built output rather than just reasoning about the
+source. Found a real one this time too: `IndexingService` recorded the
+`ai_usage_events` row BEFORE writing the actual chunks, inside the same
+error-handling scope — so a transient failure in that purely
+observational accounting insert discarded a perfectly good, already-
+computed embed pass and marked the document `'failed'` without
+`replace_document_chunks` ever even being attempted (D4.6). Proved it
+with a standalone script instantiating the real service with a
+`recordUsage` that throws before touching any source, the same
+falsification-first discipline as every other bug found this way in this
+project. Fixed by moving usage recording to run after the write, on a
+strict best-effort basis (log and swallow, never rethrow) — a hiccup in
+logging a cost can no longer take down the actual indexing result. Also
+found and fixed a smaller one the same pass: a malformed heading with no
+title text after the hashes left a dangling empty segment in
+`headingPath` instead of being filtered out. Both got permanent
+regression tests (a new `indexing.service.spec.ts` — Phase 4's service
+layer had zero unit tests before this, only e2e coverage — plus a
+`chunker.spec.ts` case), and a third gap got closed without being a bug
+exactly: nothing had ever asserted `ai_usage_events` actually receives a
+row, despite it being a real, documented part of the pipeline, so
+`indexing.e2e-spec.ts` now queries it directly (under the test user's
+own RLS, not a privileged bypass) rather than only asserting on fields
+the DTO happens to expose.

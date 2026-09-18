@@ -4,6 +4,9 @@ import type { TestingModule } from "@nestjs/testing";
 import { AiError, MockEmbeddingModel } from "@kb/ai";
 import type { CallOptions, EmbeddingModel, TokenUsage } from "@kb/ai";
 import { chunkDocument } from "@kb/rag-core";
+import type { Database } from "@kb/shared";
+import { createClient } from "@supabase/supabase-js";
+import type { SupabaseClient } from "@supabase/supabase-js";
 import request from "supertest";
 
 import { EMBEDDING_MODEL } from "../src/ai/ai.module.js";
@@ -67,6 +70,16 @@ describe("Indexing pipeline (e2e)", () => {
 
   const authed = (jwt: string) => `Bearer ${jwt}`;
 
+  // A raw client for asserting on tables the DTO doesn't expose (like
+  // ai_usage_events) — built the exact same way apps/api's own
+  // createUserScopedClient is (publishable key + this user's own JWT), so
+  // this reads under the real RLS policy, not a privileged bypass.
+  const userADb: SupabaseClient<Database> = createClient<Database>(
+    globalThis.__KB_E2E__.SUPABASE_URL,
+    "e2e-test-publishable-key",
+    { global: { headers: { Authorization: authed(userA.jwt) } }, auth: { persistSession: false, autoRefreshToken: false } },
+  );
+
   const getDoc = (id: string) =>
     request(app.getHttpServer())
       .get(`/documents/${id}`)
@@ -94,6 +107,23 @@ describe("Indexing pipeline (e2e)", () => {
     expect(ready.chunkCount).toBeGreaterThan(0);
     expect(ready.indexedAt).toBeTruthy();
     expect(ready.indexError).toBeNull();
+
+    // ai_usage_events isn't on the DTO at all, so this is the only way to
+    // prove the pipeline actually records the embedding call it made —
+    // previously nothing asserted this happens at all.
+    const { data: usageRows, error: usageError } = await userADb
+      .from("ai_usage_events")
+      .select("operation, provider, model, prompt_tokens, total_tokens, is_estimated, document_id")
+      .eq("document_id", createRes.body.id);
+    expect(usageError).toBeNull();
+    expect(usageRows).toHaveLength(1);
+    expect(usageRows?.[0]).toMatchObject({
+      operation: "embedding",
+      provider: "mock",
+      document_id: createRes.body.id,
+    });
+    expect(usageRows?.[0]?.total_tokens).toBeGreaterThan(0);
+    expect(usageRows?.[0]?.is_estimated).toBe(true);
   });
 
   it("updating content twice in quick succession ends ready with chunks matching the SECOND update", async () => {

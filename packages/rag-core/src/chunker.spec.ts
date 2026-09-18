@@ -16,6 +16,24 @@ describe("chunkDocument", () => {
     expect(chunks[0]?.content).toBe("Just a short sentence or two, nothing fancy here.");
   });
 
+  it("never leaves a dangling empty segment in headingPath for a heading with no title text", () => {
+    // "## " and "## ##" are both valid ATX headings with empty text after
+    // the hashes are stripped — malformed content a real document could
+    // still contain (a stray "##", a heading someone deleted the text
+    // from). Regression test for a bug found during Phase 4 re-validation:
+    // the empty segment used to survive into the joined path as
+    // "Handbook > Doc Title > " (trailing separator, nothing after it).
+    const content = ["# Doc Title", "## ", "", "Some content under the empty heading.", "", "## ##", "", "More content."].join(
+      "\n",
+    );
+    const chunks = chunkDocument("Handbook", content);
+    for (const chunk of chunks) {
+      expect(chunk.headingPath).not.toMatch(/>\s*$/);
+      expect(chunk.headingPath).not.toContain(">  >");
+    }
+    expect(chunks.some((c) => c.headingPath === "Handbook > Doc Title")).toBe(true);
+  });
+
   it("propagates headings into headingPath", () => {
     const content = [
       "# Getting Started",
