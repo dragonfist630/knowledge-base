@@ -7,6 +7,7 @@ import { LoggerModule } from "nestjs-pino";
 import { AiModule } from "./ai/ai.module.js";
 import { AuthGuard } from "./auth/auth.guard.js";
 import { AuthModule } from "./auth/auth.module.js";
+import { ChatModule } from "./chat/chat.module.js";
 import { HttpExceptionFilter } from "./common/http-exception.filter.js";
 import { RequestIdMiddleware } from "./common/request-id.middleware.js";
 import { UserThrottlerGuard } from "./common/user-throttler.guard.js";
@@ -15,9 +16,8 @@ import type { ApiEnv } from "./config/env.js";
 import { DocumentsModule } from "./documents/documents.module.js";
 import { IndexingModule } from "./indexing/indexing.module.js";
 import { MetaModule } from "./meta/meta.module.js";
+import { RetrievalModule } from "./retrieval/retrieval.module.js";
 
-// Feature modules (retrieval, chat, usage) are added here phase by phase,
-// starting in Phase 5.
 @Module({
   imports: [
     ConfigModule,
@@ -36,8 +36,9 @@ import { MetaModule } from "./meta/meta.module.js";
       inject: [API_ENV],
       useFactory: (env: ApiEnv) => [
         { name: "default", ttl: env.THROTTLE_DEFAULT_TTL_MS, limit: env.THROTTLE_DEFAULT_LIMIT },
-        // Not applied to any route until Phase 5 adds POST /chat/stream —
-        // registered here so that controller only needs @Throttle({ chat: {} }).
+        // Applied to POST /chat and /chat/stream via @Throttle({ chat: {} })
+        // (see chat.controller.ts) — registered here since named throttlers
+        // must be declared at the module root, not per-controller.
         { name: "chat", ttl: env.THROTTLE_CHAT_TTL_MS, limit: env.THROTTLE_CHAT_LIMIT },
       ],
     }),
@@ -45,6 +46,8 @@ import { MetaModule } from "./meta/meta.module.js";
     AiModule,
     IndexingModule,
     DocumentsModule,
+    RetrievalModule,
+    ChatModule,
     MetaModule,
   ],
   providers: [

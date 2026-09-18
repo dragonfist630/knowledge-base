@@ -16,6 +16,10 @@ const optionalString = z.preprocess(emptyToUndefined, z.string().min(1).optional
 const requiredString = (name: string) =>
   z.preprocess(emptyToUndefined, z.string().min(1, `${name} is required`));
 
+/** "true"/"false" (case-insensitive) from the environment -> boolean, defaulting when unset/empty. */
+const boolEnv = (defaultValue: boolean) =>
+  z.preprocess(emptyToUndefined, z.enum(["true", "false"]).optional()).transform((v) => (v === undefined ? defaultValue : v === "true"));
+
 const EnvSchema = z.object({
   NODE_ENV: z.preprocess(emptyToUndefined, z.enum(["development", "test", "production"]).optional()).default(
     "development",
@@ -41,6 +45,19 @@ const EnvSchema = z.object({
   RAG_CHUNK_TOKENS: z.preprocess(emptyToUndefined, z.coerce.number().int().positive().optional()).default(450),
   RAG_CHUNK_MAX_TOKENS: z.preprocess(emptyToUndefined, z.coerce.number().int().positive().optional()).default(600),
   RAG_CHUNK_OVERLAP_TOKENS: z.preprocess(emptyToUndefined, z.coerce.number().int().min(0).optional()).default(60),
+
+  /**
+   * RAG_* retrieval/chat knobs — consumed by apps/api/src/retrieval and
+   * apps/api/src/chat starting Phase 5. See docs/DECISIONS.md Phase 5 for
+   * why each default is what it is (mirrors the brief's own numbers).
+   */
+  RAG_TOP_K: z.preprocess(emptyToUndefined, z.coerce.number().int().positive().optional()).default(8),
+  RAG_MIN_SIMILARITY: z.preprocess(emptyToUndefined, z.coerce.number().min(0).max(1).optional()).default(0.25),
+  RAG_CONTEXT_TOKENS: z.preprocess(emptyToUndefined, z.coerce.number().int().positive().optional()).default(3500),
+  RAG_HISTORY_TOKENS: z.preprocess(emptyToUndefined, z.coerce.number().int().min(0).optional()).default(1500),
+  /** Master on/off switch for query rewriting — set false to always retrieve on the raw question, even with prior turns. */
+  RAG_QUERY_REWRITE: boolEnv(true),
+  RAG_QUERY_REWRITE_TIMEOUT_MS: z.preprocess(emptyToUndefined, z.coerce.number().int().positive().optional()).default(5000),
 
   THROTTLE_DEFAULT_LIMIT: z.preprocess(emptyToUndefined, z.coerce.number().int().positive().optional()).default(120),
   THROTTLE_DEFAULT_TTL_MS: z.preprocess(emptyToUndefined, z.coerce.number().int().positive().optional()).default(

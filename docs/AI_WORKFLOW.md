@@ -237,3 +237,65 @@ the original report) before confirming it passes against the fix — the
 same "prove the regression test is real" discipline used for Phase 2's
 D2.6 fix. Full pipeline and the e2e suite were both re-run clean
 afterward.
+
+## Phase 5 — retrieval and chat
+
+Asked to move on to "the next phase" without saying which; asked back
+whether that meant retrieval + chat, and whether it should include the
+Next.js web UI or just the API — answered with a link to the actual
+Google Doc project brief instead of picking an option, which turned out
+to be the first time the full, authoritative spec had ever actually been
+read (earlier phases worked from a mix of memory and inference about
+what the brief said). Retrieved it via the Google Drive connector,
+confirmed Phase 5 = backend retrieval + chat only (the web chat UI is
+explicitly Phase 6 in the brief's own schedule), and built the rest of
+the phase against that literal spec rather than reconstructing it from
+context — the exact "check the source of truth instead of inferring it"
+discipline Phase 2's D2.1 (provider presets corrected against current
+vendor docs) already established for a different kind of source.
+
+Built in dependency order, same discipline as Phase 4: the pure
+`@kb/rag-core` additions first (`prompt.ts` — the exact system-prompt/
+message-shape the brief specifies, D5.1; `citations.ts` — the
+buffering streamed-marker parser, tested by splitting messages at every
+possible offset, D5.2), then `@kb/shared`'s SSE/REST contract schemas,
+then `RetrievalService` (query rewrite, offset-based near-duplicate
+merging, token-budgeted context packing, D5.3), then `ChatService` as
+the one transport-agnostic orchestration point both `POST /chat` and
+`POST /chat/stream` share (D5.5), then the controller and SSE wiring.
+Building `prompt.ts` surfaced a real design tension worth naming: Phase
+2's `MockChatModel` doc comment assumed retrieved context would live in
+the latest user message, which conflicts with the brief's actual Phase 5
+design (sources belong in the system message) — resolved in favor of the
+brief, with the stale comment corrected rather than left misleading
+(D5.1).
+
+Writing the Gate 5 e2e test for "aborting mid-stream persists status
+'aborted'" surfaced a real bug, not a test artifact: `ChatController`'s
+SSE handler listened on `req.on("close", ...)` — the commonly-documented
+way to detect a client disconnecting mid-response — and that handler
+simply never fired on this stack (Express 5.2 / Node 22), so every abort
+attempt persisted `'complete'` instead of `'aborted'`. A temporary debug
+log confirmed the callback never ran at all; switching to
+`res.on("close", ...)` (the response's own lifecycle, not the request's)
+fixed it immediately, and is arguably the more correct object to listen
+on regardless of the version-specific behavior (D5.6). The same debugging
+pass also caught that the abort test itself, even after the fix, was
+racing `MockChatModel`'s synchronous word-by-word loop and losing most
+of the time — not a bug in the app, but a bug in the test's own timing
+assumptions. Fixed the way Phase 4's D4.5 fixed the equivalent problem
+for a forced-embedding-failure test: a small `ControllableChatModel`
+wraps the real mock and, only for this one test, waits a real 300ms
+before checking the abort signal, installed via Nest's own
+`overrideProvider` rather than any change to `@kb/ai` itself (D5.7). The
+same abort contract is additionally covered with zero timing dependency
+by unit-level tests at both the controller and service layers, so the
+one e2e scenario proves the real end-to-end wiring without being the
+only thing standing between this behavior and a regression.
+
+Ran the full pipeline and the Gate 5 e2e suite (26/26, including the
+abort test) three times in a row after the D5.6/D5.7 fixes specifically
+to confirm the abort scenario had actually stopped being flaky rather
+than just happening to pass once (D5.8) — the same "don't trust a single
+green run of something timing-sensitive" instinct Phase 4's D4.7 applied
+to its own regression test.

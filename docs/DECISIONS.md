@@ -1127,3 +1127,243 @@ originally-reported reproduction), then confirmed it passes against the
 fix. Re-ran the full pipeline from a fresh clone: `pnpm lint` /
 `typecheck` / `build` / `test` clean across every workspace, and
 `pnpm test:e2e` still 15/15 — nothing else regressed.
+
+## Phase 5
+
+### D5.1 — Prompt design: sources live in the system message, not the latest user turn
+
+The brief's Phase 5 spec is explicit about the message shape: `[system
+(rules + <sources> block), ...trimmed history, user (the bare
+question)]` — retrieved context belongs in the system message, not
+stuffed into the final user turn the way a naive RAG implementation
+often does. `buildChatMessages` (`packages/rag-core/src/prompt.ts`)
+follows this literally: `buildSystemPrompt` renders one fixed rules
+block (verbatim from the brief, snapshot-tested in `prompt.spec.ts` so a
+change to it is a deliberate, reviewed change to the assistant's
+behavior) followed by a `<source id="..." title="..." section="...">`
+per retrieved chunk, and the final user message is always just the raw
+question text, nothing appended.
+
+This created a real design tension with `packages/ai/src/mock/
+mock-chat-model.ts`, whose doc comment (written in Phase 2, before
+Phase 5's actual prompt shape existed) assumed "retrieved context +
+question would live in the latest user message." Resolved in favor of
+the brief (the stated source of truth) rather than the stale comment:
+`MockChatModel` still works correctly either way, since its citation
+generation derives `[S1]`-style markers from whatever text is in the
+latest user message, and in Phase 5's real shape that's the bare
+question — a one-sentence question still deterministically produces one
+`[S1]`-cited sentence, which is exactly what `chat.e2e-spec.ts` relies on
+being deterministic. The mock's own doc comment gets corrected in this
+phase's diff rather than left misleading.
+
+Two smaller decisions in the same file: `escapeXmlAttribute` escapes
+`&`/`"`/`<`/`>` in a source's `title`/`section` attributes but
+deliberately leaves the chunk `content` body itself unescaped, since the
+brief's literal template renders content as raw text and the real
+security boundary is the system rule telling the model to treat sources
+as data plus `citations.ts` validating every streamed marker against the
+real source-id set — not text-level escaping of prose that's meant to be
+read as prose (a title containing a literal `>` now renders as `&gt;` in
+the snapshot test, confirming the escaping works, not a bug). And
+`stripCitationMarkers` strips `[S<digits>]` markers out of a past
+assistant turn before it goes back into history, so the model never
+sees its own citation bracket-noise as something to imitate — used both
+by `buildChatMessages`'s history trimming and by `retrieval.service.ts`
+before feeding history into the (separate, "cheap") query-rewrite call.
+
+### D5.2 — Citation stream parser buffers only the minimal ambiguous bracket prefix
+
+A real streaming `ChatModel.stream()` delivers text in arbitrary
+chunk boundaries that have nothing to do with where a `[S1]`-style
+marker falls — `"[", "S", "1", "]"` in the worst case, split across four
+separate deltas. `createCitationStreamParser` (`packages/rag-core/src/
+citations.ts`) handles this by holding back only the smallest possible
+suffix of the buffer that could still grow into a complete marker (a
+trailing `[`, `[S`, `[S1`, etc. — anything matching `/^\[S?\d*$/`), and
+emitting everything else immediately, so the SSE layer streams text to
+the browser with the least possible added latency rather than batching
+whole words or sentences. `citations.spec.ts` tests this by splitting a
+message containing several markers at *every* possible character offset
+and asserting the reassembled output is identical regardless of split
+point — the brief's own bar for this component.
+
+A complete marker is validated against the real, current turn's
+source-id set (assigned by `retrieval.service.ts`, never anything the
+model or a document's own text could invent) as it's parsed; an id that
+doesn't match a real source is silently stripped from the emitted text
+rather than passed through — a hallucinated or copied-from-document-text
+`[S99]` must never reach the browser looking like a real, clickable
+citation. `chat.service.ts` logs (but doesn't surface to the user) how
+many markers were dropped per turn.
+
+### D5.3 — Retrieval: offset-based near-duplicate merging, and "always keep the first source" budgeting
+
+Two chunks from the same document with consecutive `chunk_index` values
+are the only case the chunker's own overlap step (Phase 4) can ever
+produce shared text between — so `RetrievalService.mergeAdjacent` merges
+exactly that case (same `document_id`, consecutive `chunk_index`) into
+one source block, by re-slicing the FULL document content at the
+combined `[min(charStart), max(charEnd))` offset range, rather than
+text-diffing the two chunks' content to find and remove the overlap.
+Offset-based merging is exact and cheap; text-diffing would be
+approximate and slower for a case whose shape is already fully known
+from the chunker's own contract. Only merged (multi-chunk) blocks need
+this re-fetch — a single-chunk block's content is already exactly
+`document_chunks.content`, so `packContext` only calls
+`findContentByIds` for the document ids that actually need it.
+
+Context packing then applies the `RAG_CONTEXT_TOKENS` budget by walking
+merged blocks in score order, always keeping at least the first
+(highest-scoring) block even if it alone exceeds the budget — the same
+"never end up with nothing just because the single best match happens to
+be large" principle `prompt.ts`'s own history trimming already uses.
+`sourceId`s (`S1`, `S2`, ...) are assigned in this final, post-budget,
+score-sorted order, which is also the order `citations.ts` validates
+streamed markers against and the order `chat-events.ts`'s `sources`
+event lists them in.
+
+Query rewriting (`maybeRewriteQuery`) is a separate, deliberately
+"cheap" `chatModel.complete()` call — only the last 6 history turns, a
+5s `AbortController` timeout, and any error/timeout/empty-output result
+falls back to the raw question rather than blocking or failing
+retrieval. A successful rewrite is recorded as its own `query_rewrite`
+usage event (best-effort, see D5.5), separate from the turn's own `chat`
+usage event, so cost attribution between "understanding what was asked"
+and "answering it" stays visible.
+
+### D5.4 — `UsageRepository` duplicates `IndexingRepository.recordUsage`'s logic rather than sharing it
+
+`apps/api/src/common/usage.repository.ts` is a small, deliberate copy of
+the same insert-into-`ai_usage_events` logic `IndexingRepository` (Phase
+4) already has, rather than extracting a shared base class or having one
+depend on the other. The two call sites (`query_rewrite`/`chat` events
+from retrieval and chat; `embedding`/`chunking`-adjacent events from
+indexing) belong to genuinely different features with no other coupling
+between them today, and the insert itself is a handful of straight-line
+lines — not enough shared complexity to justify the indirection a shared
+abstraction would cost, especially given the two could reasonably drift
+(a future phase adding per-operation fields to one shouldn't force a
+change to the other). Revisit if a third near-identical call site shows
+up.
+
+### D5.5 — Chat orchestration: transport-agnostic `runTurn`, `AiError`-safe messaging, best-effort usage recording
+
+`ChatService.runTurn` is the one place a full turn is driven — get/
+create the conversation, retrieval, prompt, stream, citation resolution,
+persistence, usage — and is deliberately transport-agnostic: it takes an
+optional `onEvent` callback and an optional `AbortSignal`, and returns
+the same `ChatTurnResult` either way. `POST /chat/stream`'s controller
+wires `onEvent` straight to SSE writes; `POST /chat` (the brief's
+non-streaming equivalent) calls it with no `onEvent` at all and just
+reads the returned result. This means there is exactly one place this
+orchestration logic can drift from itself between the streaming and
+non-streaming surfaces, rather than two similar-but-not-identical
+implementations.
+
+Error messaging reuses the `AiError`/`isAiError()` split
+`http-exception.filter.ts` established in Phase 3: an `AiError`'s own
+message is safe to show (it's already a friendly, provider-agnostic
+string); anything else becomes a fixed generic message
+("Something went wrong generating a response. Try again.") so a raw
+upstream/DB error string can never leak into a persisted assistant
+message or an SSE `error` event. A failure during retrieval, or mid-
+stream, is persisted as a `'error'`-status assistant message with
+whatever partial content and citations had already been produced (not
+discarded) — `persistError` is the one path both cases go through.
+
+Usage recording is best-effort, the exact D4.6 pattern (log-and-swallow,
+never rethrow) applied twice more here: `recordChatUsageBestEffort` after
+a successful stream, and `recordRewriteUsageBestEffort` after a
+successful query rewrite. A hiccup logging cost must never turn an
+otherwise-successful answer into a failure, same reasoning as D4.6's
+original fix. The no-context path (`finishNoContext`, when retrieval
+finds zero sources) records no chat usage event at all, since no LLM
+call was actually made for that turn — asserted directly in
+`chat.e2e-spec.ts`, not just left as an implication.
+
+### D5.6 — Real bug found while building the Gate 5 abort test: `req.on("close")` never fires here; `res.on("close")` does
+
+`ChatController.stream`'s SSE handler originally wired the abort signal
+to `req.on("close", () => controller.abort())` — the commonly-documented
+way to detect a client disconnecting mid-response in Express. Writing
+the Gate 5 e2e test for "aborting mid-stream persists status 'aborted'"
+(a real client destroying its socket right after reading the `start`
+event) surfaced that this handler never fires at all on this stack
+(Express 5.2 / Node 22): the persisted message consistently ended up
+`'complete'`, not `'aborted'`, and a temporary debug log confirmed
+`req.on("close")`'s callback simply never ran, even on a hard
+client-side `req.destroy()`.
+
+Switched to `res.on("close", ...)` — the `ServerResponse`'s own
+lifecycle, which Node's docs describe as firing when "the response is
+completed, or its underlying connection was terminated prematurely" —
+and confirmed the same debug log now fires reliably. This is also the
+more semantically correct object to listen on regardless of the Express-
+version-specific behavior: what actually matters here is "should this
+handler keep writing to this response," which is `res`'s lifecycle, not
+`req`'s. `chat.controller.ts`'s `@Req()` parameter was removed entirely
+once nothing else in the handler needed it. `chat.controller.spec.ts`'s
+fake-response double was extended to be a real `EventEmitter` so its own
+"aborts when the response closes" test exercises the exact same
+`res.on("close")` call the real handler makes, not a different code
+path pretending to be equivalent.
+
+### D5.7 — Gate 5 e2e: `ControllableChatModel` (same pattern as D4.5), a real ephemeral port for the abort test, SSE parsed via a custom supertest `.parse()`
+
+`chat.e2e-spec.ts` runs the same real Postgres+RLS+PostgREST harness
+Gate 3/4 already built, plus the real hybrid-retrieval RPC (Phase 1) and
+real chunker (Phase 4) — the only thing standing in is
+`AI_CHAT_PROVIDER`/`AI_EMBEDDING_PROVIDER`'s own default of `"mock"`
+(`packages/ai/src/config.ts`), so no API keys are needed, same as every
+prior e2e gate. `MockEmbeddingModel`'s bag-of-words hashing means a
+seeded document and a question sharing distinctive vocabulary reliably
+clears `RAG_MIN_SIMILARITY`, and `match_document_chunks`'s own `where
+... or kw.id is not null` clause additionally lets a real keyword match
+through regardless of the semantic score — so no test here depends on
+exact similarity numbers, only on shared keywords existing.
+
+The one scenario that couldn't just use the raw `MockChatModel` directly
+is the abort test: `MockChatModel.stream()` has no real delay anywhere
+in its word-by-word loop, so a client destroying its socket right after
+reading the `start` event was, in practice, racing a synchronous
+in-process loop it usually lost — an early version of this test observed
+`'complete'` instead of `'aborted'` on nearly every run. Fixed the same
+way D4.5 fixed the equivalent problem for indexing's forced-failure
+test: a small `ControllableChatModel` (test-file-local) wraps the real
+`MockChatModel` and, only when a one-shot flag is set immediately before
+the test's own request fires, waits a real, generous 300ms before
+checking `opts.signal?.aborted` and yielding accordingly — installed via
+`overrideProvider(CHAT_MODEL).useValue(...)`, the same standard Nest
+testing mechanism D4.5 used, not a production code change. This proves
+the real `res.close → AbortController → chatModel.stream(signal)` wiring
+end to end over a real socket, without depending on winning a race
+against an in-process loop's own speed; the exact same contract is also
+covered with zero timing dependency at all by `chat.controller.spec.ts`'s
+fake-`res`-close test and `chat.service.spec.ts`'s
+`FinishReason:'aborted'` test.
+
+That one test also needed a real listening port (`app.listen(0)`, read
+back via `getHttpServer().address()`) rather than supertest's implicit
+ephemeral bind, since it drives a raw `http.request` directly so it can
+destroy the client socket the instant the `start` event's bytes arrive —
+every other test in the file still just uses supertest against
+`app.getHttpServer()` as usual, listening or not makes no difference to
+those. Reading a full SSE response body with supertest (which doesn't
+parse `text/event-stream` out of the box) uses a small custom
+`.buffer(true).parse((res, cb) => ...)` that concatenates the raw chunks
+and hands them back as one string, then a local `parseSse()` splits on
+blank lines and picks out `data: ` lines — the same shape browsers
+themselves split an SSE stream on.
+
+### D5.8 — Full verification: fresh state, every gate green
+
+Ran the complete pipeline after Phase 5 landed: `pnpm turbo run lint
+typecheck build test --force` clean across every workspace (`@kb/rag-
+core` gained 29 new pure unit/snapshot tests across `prompt.spec.ts` and
+`citations.spec.ts`; `apps/api` gained `retrieval.service.spec.ts`,
+`chat.service.spec.ts`, and `chat.controller.spec.ts` — 53 unit tests
+total, up from 11 at the end of Phase 4), and `pnpm test:e2e` at 26/26
+(`chat.e2e-spec.ts`'s 11 new scenarios alongside the existing 15 from
+documents/indexing), re-run three times in a row to confirm the abort
+test in particular wasn't flaky after the D5.6/D5.7 fixes.
