@@ -1074,3 +1074,56 @@ now at 11 unit tests, up from 7, via the new `indexing.service.spec.ts`),
 and `pnpm test:e2e` at 15/15 again (same test count — the new
 `ai_usage_events` assertion was added to an existing test, not a new
 one).
+
+### D4.7 — Trailing-merge loop could still overflow the hard token cap; fixed a real bug surfaced by an externally-sourced claim
+
+Given a specific, falsifiable claim to check — not asked to fix anything,
+only to validate it — that the trailing-merge loop in `chunker.ts` (the
+step right after the trim pass, walking backward and merging small
+trailing chunks into their predecessor) had no check that the *merged*
+result stayed within `maxTokens`, only a check on the small chunk's own
+isolated token count against `minTrailingTokens`. Investigated read-only,
+from a fresh clone: read the loop's actual code (confirmed no
+`maxTokens` check existed anywhere in it), then wrote standalone probe
+scripts sweeping a near-budget fenced code block followed by a short
+closing sentence at production defaults (`targetTokens 450 /
+maxTokens 600`). The sweep reproduced real overflow — e.g. a 36-line
+code block (580 tokens) plus a 14-word tail merged into a single
+602-token chunk, and the sweep found overflow up to 618 tokens against
+the 600 cap. A follow-up probe isolated a single-chunk case to rule out
+chunk-overlap as the cause (no predecessor chunk existed to draw overlap
+from, yet the overflow still occurred) — the merge loop itself was the
+only remaining explanation. Reported the claim as accurate, with no
+changes made, per the explicit "just and only validate this claim"
+instruction.
+
+Asked next whether it could be fixed, then given explicit go-ahead to
+fix it. This is the exact same class of bug as `packPieces`'s own fix
+above (D4.1): a token-budget decision was being made by checking a
+piece's own isolated token count instead of the real, final concatenated
+text's actual token count — separator text between the small chunk and
+its predecessor, plus any BPE merge across the join, both cost real
+tokens once the two are one contiguous chunk, and neither is visible to
+a check that only looks at the small chunk on its own.
+
+Fixed by computing `mergedTokens` — `countTokens()` on the actual
+prospective merged slice (`prevChunk.start` to `chunk.end`), not a sum of
+the two pieces' separate counts — and skipping the merge entirely
+(leaving the small trailing chunk standing on its own) whenever that
+would exceed `maxTokens`. The hard cap must never be sacrificed just to
+avoid leaving a small trailing chunk unmerged; a small chunk by itself is
+still a perfectly valid chunk. Verified the fix directly: re-ran the
+exact same parameter sweep that had previously found overflow up to 618
+tokens, and it now found none (max observed: exactly 600, never over),
+while confirming merging still functions normally for legitimate small-
+trailing-chunk cases at more moderate settings (not an accidental no-op
+regression).
+
+Added a permanent regression test to `chunker.spec.ts` reproducing the
+36-line-code-block-plus-14-word-tail scenario, and proved the test
+itself was real before trusting it: ran it against the pre-fix code
+first and confirmed it failed at exactly 602/600 (matching the
+originally-reported reproduction), then confirmed it passes against the
+fix. Re-ran the full pipeline from a fresh clone: `pnpm lint` /
+`typecheck` / `build` / `test` clean across every workspace, and
+`pnpm test:e2e` still 15/15 — nothing else regressed.

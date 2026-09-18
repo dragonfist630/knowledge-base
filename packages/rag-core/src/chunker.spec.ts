@@ -151,6 +151,55 @@ describe("chunkDocument", () => {
     expect(countTokens(last?.content ?? "")).toBeGreaterThanOrEqual(20);
   });
 
+  it("never merges a trailing chunk into its predecessor when doing so would exceed the hard max", () => {
+    // Regression test for a bug found via an externally-sourced claim: the
+    // trailing-merge loop decided whether to merge purely by checking the
+    // SMALL trailing chunk's own isolated token count against
+    // minTrailingTokens, never checking the actual token count of the
+    // merged result against maxTokens. A near-budget predecessor (here, a
+    // fenced code block close to the cap) plus a short trailing sentence
+    // under minTrailingTokens could merge into a chunk over maxTokens even
+    // though every individual piece was within budget on its own — the
+    // same class of bug as packPieces's own "check the real final slice,
+    // not a running sum" fix above, just in a different place in the
+    // pipeline. Concretely reproduced at defaults (targetTokens 450 /
+    // maxTokens 600): a 36-line code block (580 tokens) followed by a
+    // 14-word closing sentence produced a single 602-token chunk.
+    const codeLines = Array.from(
+      { length: 36 },
+      (_, i) => `const value${i} = someFunctionCall(argumentOne, argumentTwo, ${i});`,
+    ).join("\n");
+    const code = ["```ts", codeLines, "```"].join("\n");
+    const tailWords = [
+      "This",
+      "closing",
+      "sentence",
+      "wraps",
+      "up",
+      "the",
+      "section",
+      "with",
+      "a",
+      "few",
+      "more",
+      "words",
+      "here",
+      "now",
+    ];
+    const tail = `${tailWords.join(" ")}.`;
+    const content = ["# Heading", "", "Intro sentence before the code.", "", code, "", tail].join("\n");
+
+    const chunks = chunkDocument("Merge Overflow Doc", content, {
+      targetTokens: 450,
+      maxTokens: 600,
+      overlapTokens: 60,
+    });
+    for (const chunk of chunks) {
+      expect(chunk.tokenCount).toBeLessThanOrEqual(600);
+      expect(countTokens(chunk.content)).toBeLessThanOrEqual(600);
+    }
+  });
+
   it("does not mix content from two different heading paths into one chunk", () => {
     const content = ["# One", "", "Short bit under heading one.", "", "# Two", "", "Short bit under heading two."].join(
       "\n",

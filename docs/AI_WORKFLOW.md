@@ -201,3 +201,39 @@ row, despite it being a real, documented part of the pipeline, so
 `indexing.e2e-spec.ts` now queries it directly (under the test user's
 own RLS, not a privileged bypass) rather than only asserting on fields
 the DTO happens to expose.
+
+A fourth pass on this phase started differently: instead of a broad "is
+this done" prompt, it was given one specific, falsifiable claim from
+outside the conversation — that the trailing-merge loop right after the
+chunker's trim step could still produce a chunk over the hard token cap,
+because it only checked the small trailing chunk's own isolated token
+count, never the actual merged result. Asked to "just and only validate
+this claim," so no code was touched during that pass: read the loop
+directly (no `maxTokens` check existed in it, confirming the shape of
+the claim), then wrote standalone probe scripts sweeping a near-budget
+fenced code block followed by a short closing sentence at production
+defaults, which reproduced real overflow (602 tokens, up to 618 across a
+wider sweep, against a 600 cap), plus an isolating probe that ruled out
+chunk overlap as an alternate explanation. Reported the claim as
+accurate and stopped there, exactly as asked.
+
+Only once asked separately "can you fix it" and then given explicit
+go-ahead did any code change. The bug turned out to be the identical
+class of mistake as the very first Phase 4 bug (`packPieces`'s
+over-budget chunks, above): a token-budget decision made by summing or
+checking pieces in isolation instead of checking the real, final
+concatenated text — the separator between a small trailing chunk and its
+predecessor, and any BPE merge across that join, both cost real tokens
+once they're one contiguous string, and neither shows up if you only
+ever look at the two pieces separately (D4.7). Fixed by checking the
+actual prospective merged slice's real token count and skipping the
+merge (leaving the small chunk standing alone, which is still a
+perfectly valid chunk) whenever merging would cross `maxTokens`.
+Verified two ways before trusting it: re-ran the exact sweep that had
+found overflow up to 618 tokens and confirmed it now finds none, and
+wrote a permanent regression test that was deliberately run against the
+pre-fix code first to confirm it actually fails there (602/600, matching
+the original report) before confirming it passes against the fix — the
+same "prove the regression test is real" discipline used for Phase 2's
+D2.6 fix. Full pipeline and the e2e suite were both re-run clean
+afterward.

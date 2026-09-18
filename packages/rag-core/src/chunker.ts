@@ -451,10 +451,23 @@ export function chunkDocument(title: string, content: string, options: ChunkOpti
     const isTrailingInSection = i === packed.length - 1 || nextChunk?.headingPath !== chunk.headingPath;
     if (!isTrailingInSection) continue;
     const tokens = countTokens(normalizedText.slice(chunk.start, chunk.end));
-    if (tokens < minTrailingTokens) {
-      prevChunk.end = chunk.end;
-      packed.splice(i, 1);
-    }
+    if (tokens >= minTrailingTokens) continue;
+
+    // Check the ACTUAL merged slice's real token count, not just the small
+    // chunk's own isolated count — same principle as packPieces's own
+    // "check the real final slice" fix (see its comment above): prevChunk
+    // could already be packed right up against maxTokens (a near-budget
+    // atomic code block/table, for instance), and the separator text
+    // between the two plus any BPE merge across the join still costs real
+    // tokens once they're one contiguous chunk. Merging unconditionally
+    // here was a real, confirmed bug — the hard cap must never be
+    // sacrificed just to avoid leaving a small trailing chunk unmerged; a
+    // small chunk on its own is still a perfectly valid chunk.
+    const mergedTokens = countTokens(normalizedText.slice(prevChunk.start, chunk.end));
+    if (mergedTokens > maxTokens) continue;
+
+    prevChunk.end = chunk.end;
+    packed.splice(i, 1);
   }
 
   // Apply overlap: each chunk (after the first) that shares its
