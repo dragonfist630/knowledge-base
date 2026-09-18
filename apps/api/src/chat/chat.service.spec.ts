@@ -255,6 +255,12 @@ describe("ChatService.runTurn — error paths", () => {
     expect(result.assistantMessage.status).toBe("error");
     expect(events.at(-1)).toMatchObject({ type: "error", code: "ai_unavailable" });
     expect(usageRepository.recordUsage).not.toHaveBeenCalled();
+    // An errored turn still counts as activity — the conversation's
+    // updated_at must still advance, same as the success and no-context
+    // paths (found during Phase 5 re-validation; previously this path
+    // skipped touch() entirely, so an errored conversation never sorted
+    // as recently active).
+    expect(repository.touch).toHaveBeenCalledWith(FAKE_DB, result.conversationId);
   });
 
   it("persists whatever partial text streamed before a mid-stream failure, with citations already seen", async () => {
@@ -281,6 +287,7 @@ describe("ChatService.runTurn — error paths", () => {
       }),
     );
     expect(events.at(-1)?.type).toBe("error");
+    expect(repository.touch).toHaveBeenCalledWith(FAKE_DB, result.conversationId);
   });
 
   it("uses a generic message for a non-AiError failure, never leaking the raw error", async () => {

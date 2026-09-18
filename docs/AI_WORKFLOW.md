@@ -299,3 +299,25 @@ to confirm the abort scenario had actually stopped being flaky rather
 than just happening to pass once (D5.8) — the same "don't trust a single
 green run of something timing-sensitive" instinct Phase 4's D4.7 applied
 to its own regression test.
+
+Asked directly, after all of that, whether Phase 5 was "really done,
+without gaps or bugs" — the same recurring skeptical-re-validation
+exercise as D1.5/D2.6/D3.6-D3.7/D4.6-D4.7, run from a fresh clone of the
+pushed commit rather than trusting D5.8's own green run. Reading
+`packContext` adversarially turned up a real greedy-packing bug: the
+budget loop `break`s the moment any block fails to fit, so one oversized
+mid-ranked block wrongly knocked a smaller, still-fitting, lower-ranked
+block out of the context too — proved with a standalone probe before
+touching any code, fixed by changing that `break` to a `continue`, and
+locked in with a three-block regression test the existing suite had no
+equivalent of. Re-reading `ChatService` against its own stated
+invariants (every terminal path touches the conversation) caught the
+second one: `persistError` was the one path that didn't call
+`repository.touch()`, so a turn that ended in an error never bumped its
+conversation's `updated_at` despite real activity having just happened —
+fixed by threading the conversation id into `persistError` and touching
+it there too, same as the other two paths, with assertions added to the
+two existing error-path tests to prove it (D5.9). Re-ran the full
+pipeline and e2e suite again after both fixes — still fully green — before
+reporting the verdict back rather than assuming the fixes were correct
+because they looked right.

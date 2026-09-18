@@ -183,7 +183,11 @@ export class RetrievalService {
    * per the brief's step 3, then applies the RAG_CONTEXT_TOKENS budget,
    * walking blocks in score order and always keeping at least the first
    * one even if it alone exceeds the budget (same "never end up with
-   * nothing" principle as rag-core's history trimming).
+   * nothing" principle as rag-core's history trimming). A block that
+   * doesn't fit the remaining budget is skipped, not treated as the end
+   * of packing — blocks are sorted by score, but a big mid-ranked block
+   * shouldn't crowd out a smaller, lower-ranked one that would still fit
+   * (greedy best-fit-by-score, not "stop at the first miss").
    */
   private async packContext(db: SupabaseClient<Database>, rows: MatchedChunk[]): Promise<Source[]> {
     const blocks = this.mergeAdjacent(rows);
@@ -210,7 +214,7 @@ export class RetrievalService {
     let usedTokens = 0;
     for (const block of blocks) {
       const tokens = countTokens(block.content);
-      if (sources.length > 0 && usedTokens + tokens > this.env.RAG_CONTEXT_TOKENS) break;
+      if (sources.length > 0 && usedTokens + tokens > this.env.RAG_CONTEXT_TOKENS) continue;
       usedTokens += tokens;
       sources.push({
         sourceId: `S${sources.length + 1}`,

@@ -1367,3 +1367,68 @@ total, up from 11 at the end of Phase 4), and `pnpm test:e2e` at 26/26
 (`chat.e2e-spec.ts`'s 11 new scenarios alongside the existing 15 from
 documents/indexing), re-run three times in a row to confirm the abort
 test in particular wasn't flaky after the D5.6/D5.7 fixes.
+
+### D5.9 — Independent re-validation pass: two real bugs found and fixed
+
+Asked directly "is Phase 5 really done, without gaps or bugs?" after
+D5.8 already reported everything green — the same recurring exercise as
+D1.5/D2.6/D3.6-D3.7/D4.6-D4.7: a fresh clone of the pushed commit, an
+adversarial read of every new file against what it claims to do, and
+standalone probes to check specific hypotheses against real behavior
+rather than trusting the reasoning alone.
+
+Found two real issues, both confirmed against the fresh clone's actual
+current source (not memory of writing it):
+
+1. **`RetrievalService.packContext`'s budget loop used `break` instead
+   of `continue`.** Blocks are walked in score order and packed until
+   `RAG_CONTEXT_TOKENS` is exhausted; the loop `break`s the instant any
+   block fails to fit, which wrongly discards every remaining block too
+   — including a smaller, lower-scored one later in the list that would
+   still have fit in the leftover budget. Proved it with a standalone
+   probe before touching any code: three blocks (A fits, B doesn't, C
+   is small enough to fit after A alone) — the pre-fix code returned
+   only `[A]`, silently dropping `C` for no reason other than B's size.
+   Confirmed the existing "context token budget" test suite had no
+   scenario covering more than two blocks, so this gap had no coverage
+   either. Fixed by changing `break` to `continue` (skip an oversized
+   block, keep scanning for smaller ones that fit — the same greedy
+   best-fit-by-score approach, just not stopping at the first miss),
+   verified against the same probe (now returns `[A, C]`), and added a
+   permanent regression test reproducing that exact three-block scenario
+   to `retrieval.service.spec.ts`.
+
+2. **`ChatService.persistError` never called `this.repository.touch()`.**
+   Both other terminal paths of a turn — `streamAnswer`'s success case
+   and `finishNoContext` — call `touch()` to bump the conversation's
+   `updated_at` after finishing. `persistError` (used both when
+   retrieval throws and when the model stream fails mid-generation) did
+   not, so a conversation that ended in an error message never advanced
+   its `updated_at` and wouldn't sort correctly in a "most recently
+   active" conversation list, even though real activity (a user message,
+   an error message) had just been written to it. Fixed by threading
+   `conversationId` into `persistError` and calling `touch()` there too,
+   matching the other two paths exactly. Added assertions to both
+   existing error-path tests in `chat.service.spec.ts` (`retrieval
+   throws` and `mid-stream failure`) confirming `repository.touch` is
+   now called with the conversation id.
+
+Checked and ruled out as non-issues: `RetrievalRepository`'s RLS
+scoping (every query still goes through the caller's request-scoped
+client; `match_document_chunks` is `security invoker` and filters on
+`auth.uid()` directly, belt-and-suspenders with RLS on
+`document_chunks` itself); the `chat` throttle bucket's wiring in
+`app.module.ts` (correctly registered, reuses the same `UserThrottlerGuard`
+mechanism already covered by Phase 3's tests, just under a different
+named bucket — a dedicated 429-on-chat-bucket e2e test would be a nice-
+to-have but isn't a gap in the guard itself); and the theoretical case
+of a source document's own body containing literal `[S3]`-shaped text
+being echoed back as a fake-looking citation — real in principle for any
+RAG system that trusts document content, but out of scope for this pass
+since it isn't specific to anything Phase 5 introduced.
+
+Re-ran the full pipeline and e2e suite from the same fresh clone after
+both fixes: `pnpm turbo run lint typecheck build test --force` clean
+(54 unit tests, up from 53 — the two new/extended tests), `pnpm
+test:e2e` still 26/26. Verdict: Phase 5 had two real, if minor, bugs;
+both are now fixed, covered by regression tests, and verified.

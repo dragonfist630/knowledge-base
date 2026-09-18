@@ -314,4 +314,23 @@ describe("RetrievalService — context token budget", () => {
     const result = await service.retrieve(FAKE_DB, { question: "q", history: [] }, "conv-1");
     expect(result.sources).toEqual([]);
   });
+
+  it("skips a mid-ranked block that doesn't fit the remaining budget, but still packs a smaller, lower-ranked block after it", async () => {
+    // Found during Phase 5 re-validation: the packing loop used to `break`
+    // as soon as any block failed to fit, so block B (too big) wrongly
+    // knocked out block C too, even though C alone would have fit fine in
+    // the budget left after A. It should `continue` past B instead.
+    const rows: MatchedChunk[] = [
+      chunk({ chunkId: "a", documentId: "doc-a", chunkIndex: 0, content: "word ".repeat(10), score: 0.9 }), // fits
+      chunk({ chunkId: "b", documentId: "doc-b", chunkIndex: 0, content: "word ".repeat(40), score: 0.8 }), // too big, must be skipped
+      chunk({ chunkId: "c", documentId: "doc-c", chunkIndex: 0, content: "word ".repeat(5), score: 0.7 }), // small enough to still fit
+    ];
+    const env = { ...FAKE_ENV, RAG_CONTEXT_TOKENS: 30 } as unknown as ApiEnv;
+    const repository = makeRepository(rows);
+    const service = new RetrievalService(env, makeChatModel(), makeEmbeddingModel(), repository, makeUsageRepository());
+
+    const result = await service.retrieve(FAKE_DB, { question: "q", history: [] }, "conv-1");
+
+    expect(result.sources.map((s) => s.chunkIds[0])).toEqual(["a", "c"]);
+  });
 });

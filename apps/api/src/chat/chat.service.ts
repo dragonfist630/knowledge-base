@@ -125,7 +125,7 @@ export class ChatService {
         conversation.id,
       );
     } catch (error) {
-      const assistantMessage = await this.persistError(db, assistantPlaceholder.id, "", [], null, error, emit);
+      const assistantMessage = await this.persistError(db, conversation.id, assistantPlaceholder.id, "", [], null, error, emit);
       return { conversationId: conversation.id, userMessage, assistantMessage, sources: [] };
     }
 
@@ -288,7 +288,7 @@ export class ChatService {
         sourceCount: retrieval.sources.length,
       };
       const citations = this.buildCitationSnapshots(citedOrder, retrieval.sources);
-      return this.persistError(db, assistantMessageId, fullText, citations, retrievalDebug, error, emit);
+      return this.persistError(db, conversation.id, assistantMessageId, fullText, citations, retrievalDebug, error, emit);
     }
 
     const status: MessageStatus = finishReason === "aborted" ? "aborted" : "complete";
@@ -358,6 +358,7 @@ export class ChatService {
 
   private async persistError(
     db: SupabaseClient<Database>,
+    conversationId: string,
     assistantMessageId: string,
     partialContent: string,
     citations: CitationSnapshot[],
@@ -376,6 +377,12 @@ export class ChatService {
       retrieval,
       model: null,
     });
+    // Same as the success and no-context paths (streamAnswer / finishNoContext)
+    // — an errored turn still counts as activity on the conversation, and
+    // omitting this meant a conversation that errored never bumped
+    // updated_at, so it wouldn't sort correctly in "most recently active"
+    // order (found during Phase 5 re-validation; see docs/DECISIONS.md).
+    await this.repository.touch(db, conversationId);
     emit({ type: "error", code, message });
     return finalized;
   }
