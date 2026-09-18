@@ -321,3 +321,35 @@ two existing error-path tests to prove it (D5.9). Re-ran the full
 pipeline and e2e suite again after both fixes — still fully green — before
 reporting the verdict back rather than assuming the fixes were correct
 because they looked right.
+
+Handed a third, specific, falsifiable claim next: that `mergeAdjacent`
+merges consecutive-`chunk_index` chunks without ever checking
+`heading_path`, and that two adjacent chunks from different sections —
+which the chunker never overlaps and never puts heading text into —
+would get merged anyway, corrupting both the reported `headingPath` and
+the content sent to the model. Asked only to validate it, not fix it —
+read `mergeAdjacent`'s actual merge condition to confirm it really was
+`chunkIndex`-only, read `chunker.ts` to confirm the chunker's own
+stated behavior the claim leaned on, then wrote a probe feeding the
+real `chunkDocument()` output straight into the real `RetrievalService`
+rather than trusting a synthetic fixture. It reproduced exactly what
+was claimed: a merged source reporting only the first chunk's
+`headingPath`, with the second section's literal `"## Section B"`
+heading line spliced into the content the model would receive as a
+source. Confirmed both fields matter, not just cosmetically —
+`headingPath` feeds `prompt.ts`'s `<source section="...">` attribute
+and the citation location shown to the user. Reported the claim
+accurate with no code touched, the same validate-before-fixing
+discipline D4.7 used for its own externally-sourced claim.
+
+Asked to fix it. Added a `headingPath` equality check alongside the
+existing `chunkIndex` adjacency check in `mergeAdjacent` — the two
+conditions together are what the chunker can actually guarantee shared
+text between. Proved the new regression tests weren't vacuous by
+running them against the pre-fix code first (both failed, reproducing
+the exact reported symptom) before confirming they passed against the
+fix — one synthetic-fixture test matching the file's existing style,
+and one end-to-end test built on the real chunker output, since a
+hand-crafted fixture alone wouldn't have proven the fix addresses what
+production actually does (D5.10). Full pipeline and e2e suite both
+clean afterward.

@@ -1432,3 +1432,52 @@ both fixes: `pnpm turbo run lint typecheck build test --force` clean
 (54 unit tests, up from 53 — the two new/extended tests), `pnpm
 test:e2e` still 26/26. Verdict: Phase 5 had two real, if minor, bugs;
 both are now fixed, covered by regression tests, and verified.
+
+### D5.10 — `mergeAdjacent` merged chunks from different sections; fixed a real bug surfaced by an externally-sourced claim
+
+Given a specific, falsifiable claim to check — not asked to fix
+anything, only to validate it — that `RetrievalService.mergeAdjacent`
+merges two retrieved chunks whenever they're from the same document
+with consecutive `chunk_index`, without ever checking `heading_path`,
+even though D5.3's own justification for merging ("consecutive-index
+chunks are the only case the chunker's overlap step can ever produce
+shared text between") doesn't actually imply all consecutive-index
+chunks should merge — the chunker explicitly never applies overlap
+across a heading boundary, so two adjacent chunks from different
+sections share no text at all.
+
+Investigated read-only, from a fresh clone: read `mergeAdjacent`'s
+actual merge condition (confirmed it checks only `chunkIndex`, never
+`headingPath`), then read `chunker.ts` to confirm both of the claim's
+premises about chunking behavior (headings never become chunk content;
+overlap is skipped whenever `prev.headingPath !== curr.headingPath`).
+Wrote a standalone probe using the real, unmodified `chunkDocument()`
+fed straight into the real `RetrievalService` — not a synthetic
+fixture — with a two-section document. It reproduced both claimed
+symptoms exactly: the merged source reported `headingPath` as only the
+first chunk's section, and its `content` contained the literal `"##
+Section B"` heading line — text that was never part of either original
+chunk's content. Traced both fields forward and confirmed they aren't
+cosmetic: `headingPath` is what `prompt.ts` puts into the `<source
+section="...">` attribute the model sees, and what `chat.service.ts`
+surfaces to the user as the citation's location. Reported the claim as
+accurate, with no changes made, per the "just validate this" framing —
+the same discipline as D4.7's validate-first pass.
+
+Asked next to fix it. Fixed by adding a `row.headingPath ===
+current.headingPath` check alongside the existing `chunkIndex`
+adjacency check in `mergeAdjacent` — two chunks now only merge when
+they're both index-adjacent AND from the same section, which is the
+actual condition under which the chunker can have left shared text
+between them. Verified against the same probe (now returns two
+separate sources, each with its own correct `headingPath` and no
+leaked heading markup) and proved the regression tests aren't vacuous
+by running them against the pre-fix code first (both failed, exactly
+reproducing the reported symptom) before confirming they pass against
+the fix. Added two permanent tests to `retrieval.service.spec.ts`: a
+synthetic-fixture version matching the file's existing style, and an
+end-to-end version that runs the real `chunkDocument()` output through
+`RetrievalService`, reproducing the exact scenario rather than only a
+hand-crafted one. Re-ran the full pipeline and e2e suite from the same
+clone: clean throughout, 56/56 unit tests (up from 54), 26/26 e2e —
+nothing else regressed.

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ChatCompletion, ChatModel, EmbeddingModel } from "@kb/ai";
+import { chunkDocument } from "@kb/rag-core";
 import type { HistoryTurn } from "@kb/rag-core";
 
 import type { ApiEnv } from "../config/env.js";
@@ -247,6 +248,59 @@ describe("RetrievalService — near-duplicate (overlap-adjacent) merging", () =>
     const result = await service.retrieve(FAKE_DB, { question: "q", history: [] }, "conv-1");
 
     expect(result.sources).toHaveLength(2);
+  });
+
+  it("does NOT merge adjacent-index chunks from the SAME document that have different heading_path", async () => {
+    // D5.10: consecutive chunk_index alone isn't enough — the chunker
+    // never applies overlap across a heading boundary and never includes
+    // heading lines in chunk content, so two chunks from different
+    // sections share no text even when index-adjacent. Merging them used
+    // to report the wrong (first chunk's) heading_path and splice the
+    // second section's own heading markup into the re-sliced content.
+    const rows: MatchedChunk[] = [
+      chunk({ chunkId: "c0", chunkIndex: 0, headingPath: "Doc One > Section A", content: "Section A content.", score: 0.9 }),
+      chunk({ chunkId: "c1", chunkIndex: 1, headingPath: "Doc One > Section B", content: "Section B content.", score: 0.7 }),
+    ];
+    const repository = makeRepository(rows);
+    const service = new RetrievalService(FAKE_ENV, makeChatModel(), makeEmbeddingModel(), repository, makeUsageRepository());
+
+    const result = await service.retrieve(FAKE_DB, { question: "q", history: [] }, "conv-1");
+
+    expect(result.sources).toHaveLength(2);
+    expect(result.sources.map((s) => s.chunkIds)).toEqual([["c0"], ["c1"]]);
+    expect(result.sources.map((s) => s.headingPath)).toEqual(["Doc One > Section A", "Doc One > Section B"]);
+    // Never re-fetches/re-slices document content for chunks that didn't merge.
+    expect(repository.findContentByIds).toHaveBeenCalledWith(FAKE_DB, []);
+  });
+
+  it("real chunker output: adjacent chunks from different sections stay separate, with no leaked heading markup", async () => {
+    // End-to-end regression for D5.10, against the actual chunker rather
+    // than synthetic fixtures — reproduces the exact failure mode the
+    // independent re-validation found.
+    const title = "My Doc";
+    const content = "## Section A\n\nThis is the content of section A. It talks about apples.\n\n## Section B\n\nThis is the content of section B. It talks about oranges.\n";
+    const chunks = chunkDocument(title, content, { targetTokens: 20, maxTokens: 40, overlapTokens: 5, minTrailingTokens: 3 });
+    const a = chunks.find((c) => c.headingPath?.includes("Section A"));
+    const b = chunks.find((c) => c.headingPath?.includes("Section B"));
+    if (!a || !b) throw new Error("expected the fixture document to produce one chunk per section");
+    expect(b.chunkIndex).toBe(a.chunkIndex + 1); // genuinely index-adjacent
+
+    const rows: MatchedChunk[] = [
+      chunk({ chunkId: "chunk-a", documentId: "doc-1", documentTitle: title, chunkIndex: a.chunkIndex, headingPath: a.headingPath, content: a.content, charStart: a.charStart, charEnd: a.charEnd, score: 0.9 }),
+      chunk({ chunkId: "chunk-b", documentId: "doc-1", documentTitle: title, chunkIndex: b.chunkIndex, headingPath: b.headingPath, content: b.content, charStart: b.charStart, charEnd: b.charEnd, score: 0.85 }),
+    ];
+    const repository = makeRepository(rows, { findContentByIds: vi.fn(async () => new Map([["doc-1", content]])) });
+    const service = new RetrievalService(FAKE_ENV, makeChatModel(), makeEmbeddingModel(), repository, makeUsageRepository());
+
+    const result = await service.retrieve(FAKE_DB, { question: "q", history: [] }, "conv-1");
+
+    expect(result.sources).toHaveLength(2);
+    const sourceA = result.sources.find((s) => s.headingPath?.includes("Section A"));
+    const sourceB = result.sources.find((s) => s.headingPath?.includes("Section B"));
+    expect(sourceA?.content).not.toContain("#");
+    expect(sourceB?.content).not.toContain("#");
+    expect(sourceA?.headingPath).toBe(a.headingPath);
+    expect(sourceB?.headingPath).toBe(b.headingPath);
   });
 
   it("does not re-fetch document content for single-chunk (unmerged) sources", async () => {

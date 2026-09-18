@@ -177,10 +177,9 @@ export class RetrievalService {
   }
 
   /**
-   * Merges overlap-adjacent chunks (same document, consecutive
-   * chunk_index — the only case the chunker's own overlap step can ever
-   * have produced shared text between two chunks) into one source block
-   * per the brief's step 3, then applies the RAG_CONTEXT_TOKENS budget,
+   * Merges overlap-adjacent chunks — same document, consecutive
+   * chunk_index, AND matching heading_path — into one source block per
+   * the brief's step 3, then applies the RAG_CONTEXT_TOKENS budget,
    * walking blocks in score order and always keeping at least the first
    * one even if it alone exceeds the budget (same "never end up with
    * nothing" principle as rag-core's history trimming). A block that
@@ -188,6 +187,17 @@ export class RetrievalService {
    * of packing — blocks are sorted by score, but a big mid-ranked block
    * shouldn't crowd out a smaller, lower-ranked one that would still fit
    * (greedy best-fit-by-score, not "stop at the first miss").
+   *
+   * Both conditions on the merge are load-bearing, not just consecutive
+   * chunk_index: the chunker never applies overlap across a heading
+   * boundary and never includes a heading line in a chunk's own content
+   * (see chunker.ts), so two chunks from different sections share no
+   * text at all even when index-adjacent. Merging on index alone used to
+   * report the wrong (first chunk's) heading_path for the merged block
+   * and splice the second chunk's heading markup — text that was never
+   * part of either original chunk — into the content sent to the LLM as
+   * a source (found and fixed during Phase 5 re-validation; see
+   * docs/DECISIONS.md D5.10).
    */
   private async packContext(db: SupabaseClient<Database>, rows: MatchedChunk[]): Promise<Source[]> {
     const blocks = this.mergeAdjacent(rows);
@@ -248,7 +258,7 @@ export class RetrievalService {
       const sorted = [...docRows].sort((a, b) => a.chunkIndex - b.chunkIndex);
       let current: MergedBlock | null = null;
       for (const row of sorted) {
-        if (current && row.chunkIndex === current.maxChunkIndex + 1) {
+        if (current && row.chunkIndex === current.maxChunkIndex + 1 && row.headingPath === current.headingPath) {
           current.maxChunkIndex = row.chunkIndex;
           current.chunkIds.push(row.chunkId);
           current.charStart = Math.min(current.charStart, row.charStart);
