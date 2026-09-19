@@ -1868,3 +1868,36 @@ but `--watch` mode never deletes `dist` mid-session, so a consumer
 compiling at any point during `turbo dev` — at startup or after a later
 source edit — always sees a complete, valid package rather than a
 directory that's momentarily empty or mid-rewrite.
+
+### D6.11 — `proxy.ts` still saw empty `NEXT_PUBLIC_SUPABASE_*` even with a correct root `.env` and a confirmed-working `loadEnvConfig` call
+
+With D6.8/D6.10 fixed and a genuinely fresh `pnpm dev` (confirmed by a
+clean `apps/api` boot log with none of the earlier TS errors), `apps/web`
+still threw `Your project's URL and Key are required to create a Supabase
+client!` from `src/proxy.ts`, every time, even after deleting `apps/web/.next`
+and restarting. Isolated the exact mechanism `next.config.ts` relies on —
+a standalone script that does nothing but call `loadEnvConfig(repoRoot)`
+and read `process.env.NEXT_PUBLIC_SUPABASE_URL` back — and it correctly
+returned the real local Supabase URL every time. So the root `.env` was
+correct, `loadEnvConfig` was correctly loading it, and `apps/web`'s pages
+worked fine — only `proxy.ts` specifically never saw it.
+
+Root cause: Next 16 renamed `middleware.ts` to `proxy.ts` and changed its
+default runtime to Node.js, but its own file-convention docs still warn
+"Proxy is meant to be invoked separately of your render code... you
+should not attempt relying on shared modules or globals" — Turbopack
+compiles it as its own isolated bundle, and in this setup that
+compilation did not reliably inherit the plain `process.env` mutation
+`loadEnvConfig` performs as a side effect at the top of `next.config.ts`,
+even though every other part of the app (which Turbopack compiles
+through its normal, non-isolated path) picked the same mutation up fine.
+
+Fixed by also declaring the four `NEXT_PUBLIC_*` values the app actually
+uses (`NEXT_PUBLIC_API_URL`, `NEXT_PUBLIC_SITE_URL`,
+`NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`) through
+Next's own `env` config key in `next.config.ts`, right after the
+`loadEnvConfig` call. `env` is Next's own supported mechanism for
+guaranteeing a value is inlined into every compilation target it
+produces — including an isolated bundle like `proxy.ts` — rather than
+depending on that target having independently picked up a `process.env`
+side effect performed elsewhere.

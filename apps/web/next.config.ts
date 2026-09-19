@@ -11,7 +11,32 @@ import type { NextConfig } from "next";
 const repoRoot = path.resolve(__dirname, "../..");
 loadEnvConfig(repoRoot);
 
+// Turbopack compiles `proxy.ts` (Node.js runtime, but built as its own
+// isolated bundle — see its own file-convention docs: "you should not
+// attempt relying on shared modules or globals") separately from the rest
+// of the app, and in local testing that compilation did not reliably pick
+// up `NEXT_PUBLIC_*` values that `loadEnvConfig` above had only set as a
+// `process.env` side effect: apps/web's pages saw them fine, but a
+// `next dev` restart could still throw "Your project's URL and Key are
+// required to create a Supabase client!" from inside `proxy.ts`, with the
+// exact same root `.env` confirmed correct on disk and confirmed loaded by
+// this same `loadEnvConfig` call in isolation (a standalone script doing
+// nothing but this call and reading `process.env` back showed the right
+// values every time). Declaring them again here, through Next's own `env`
+// config key, routes them through the one inlining mechanism Next
+// guarantees reaches every compilation target it produces — including
+// `proxy.ts` — rather than depending on each target picking up a plain
+// `process.env` mutation on its own. See docs/DECISIONS.md Phase 6, D6.11.
+const publicEnv = {
+  NEXT_PUBLIC_API_URL: process.env.NEXT_PUBLIC_API_URL,
+  NEXT_PUBLIC_SITE_URL: process.env.NEXT_PUBLIC_SITE_URL,
+  NEXT_PUBLIC_SUPABASE_URL: process.env.NEXT_PUBLIC_SUPABASE_URL,
+  NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY,
+};
+
 const nextConfig: NextConfig = {
+  env: publicEnv,
+
   // Next's dev server refuses to start a second instance against the same
   // project directory — even on a different port — because its "another
   // dev server is already running" lock lives in `.next/` and is keyed by
