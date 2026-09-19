@@ -1774,3 +1774,42 @@ truly broken flow still fails within that budget rather than needing
 the full 90s to prove it's broken. Verified by deleting `.next-e2e` and
 re-running from-scratch three times in a row: consistently green,
 34-36s each, comfortably under the new budget.
+
+### D6.8 — Local `pnpm dev` intermittently failed with "no exported member" from @kb/shared: dev task had no build ordering
+
+Reported from a real local dev run (not Gate 6, which always builds
+from a fresh checkout in dependency order): `apps/api`'s NestJS watch
+compiler failed with `TS2305: Module '"@kb/shared"' has no exported
+member 'ChatRequestSchema'` (and ~30 similar errors) immediately after
+a fresh `pnpm install`. `packages/shared/dist` was confirmed to
+already contain every one of the "missing" exports by the time this
+was investigated — so the built output was correct, but stale relative
+to what the running dev process had loaded.
+
+Root cause: `turbo.json`'s `dev` task had no `dependsOn`, so `turbo dev`
+started `@kb/shared`'s `tsup --watch`, `apps/api`'s `nest start --watch`,
+and `apps/web`'s `next dev` all concurrently. On a fresh install (empty
+or missing `packages/shared/dist`), `apps/api`'s watch compiler can load
+its very first program before `tsup`'s initial build finishes writing
+`dist/index.d.ts` — and because NestJS's watch compiler doesn't re-check
+node_modules on later file changes, it keeps reporting the exports it
+saw at that first, incomplete snapshot even after `tsup` finishes.
+Every other task that touches workspace packages (`build`, `lint`,
+`typecheck`, `test`) already had `dependsOn: ["^build"]`; `dev` was the
+one task that didn't, since making a *persistent* task depend on a
+one-shot `build` task is unusual — but here it's exactly what's needed:
+it forces `@kb/shared#build` to run once and complete before any
+dependent app's `dev` task starts, after which `@kb/shared`'s own `dev`
+(`tsup --watch`) takes over for incremental rebuilds.
+
+Fixed by adding `"dependsOn": ["^build"]` to the `dev` task in
+`turbo.json`. This only affects task *ordering* on startup (build the
+dependency once, then start every `dev` script, including the
+dependency's own watcher, together) — it does not disable hot-reload
+for `packages/shared`, since `tsup --watch` still runs as part of `dev`
+once that initial build has completed. Not caught by Gate 6 because its
+`webServer` entries only ever start against a checkout where `pnpm
+install` (and thus every workspace package's build, via other commands
+run beforehand in that harness) had already completed — this race is
+specific to `turbo dev` being the very first command run after a fresh
+`node_modules`.
