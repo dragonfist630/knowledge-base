@@ -1693,3 +1693,84 @@ even on a different port (its lock lives in `.next/`, keyed by
 directory) — resolved with a `NEXT_DIST_DIR` env var routing Gate 6's
 own `next dev` to a separate `.next-e2e` build directory, leaving a
 person's own `:3000` dev server (and its lock) untouched.
+
+### D6.6 — A brand-new conversation's first answer never streamed: `router.replace` unmounted the live stream mid-turn
+
+Asked to validate Phase 6 was really done, dispatched an independent
+subagent with no memory of this codebase's history to read the Phase-6
+frontend adversarially, cross-checked its one finding personally before
+accepting it (same discipline as every other bug reported in this
+project). The claim: `/chat` and `/chat/[conversationId]` are two
+separate `page.tsx` files, not one component parameterized by a route
+param, so a real Next.js navigation between them unmounts and remounts
+whatever's rendered — and `chat-view.tsx`'s `handleStarted` called
+`router.replace('/chat/' + newConversationId)` the moment the SSE
+`start` event reported the server-assigned id, which is the *first*
+event of every turn, arriving well before any `delta`. That navigation
+unmounted the in-flight `useChatStream` instance mid-turn: the
+`send()` async generator kept running (it's a plain closure, not tied
+to React's lifecycle) and kept calling `dispatch()`, but into a
+`useReducer` whose owning component no longer existed, so every
+subsequent `delta`/`citation`/`done` — and any `error` — was silently
+dropped. The freshly-mounted `/chat/[conversationId]` page created its
+own brand-new `useChatStream` that never called `send()`, so the user
+saw nothing (not even a "Searching…" indicator) until the turn finished
+server-side and a background query invalidation pulled the completed
+answer back in as one static block.
+
+Verified directly rather than trusting the report: read
+`chat-view.tsx`/`use-chat-stream.ts`, confirmed no shared `layout.tsx`
+exists between the two chat routes, then wrote a diagnostic Playwright
+script polling the message area's text and the URL every 300ms (later
+50ms) through a real new-conversation send. It reproduced exactly what
+was claimed: the URL flips to `/chat/[id]` a moment after send, and the
+message area's content genuinely drops (to the composer's empty state,
+in one run; to a shorter string, in another) right at that instant,
+before the full answer reappears ~300ms later via the refetch — not a
+permanent loss of the final answer, but a real, visible break in the
+"streams live" experience the brief specifies, and a completely silent
+failure mode for the rarer but real case of a stream erroring mid-turn.
+
+Fixed by no longer letting URL adoption be a real navigation: `chat-
+view.tsx` now tracks the adopted `conversationId` as local component
+state (seeded from the route param, updated by `handleStarted`) and
+updates the address bar with `window.history.replaceState` instead of
+`router.replace` — same visible URL, same browser-history semantics
+(replace, not push), but no App Router navigation and therefore no
+remount, since React preserves a component's hook state across
+re-renders of the same mounted instance regardless of what argument
+values change. `useConversation` and `ConversationList`'s `activeId`
+now read that same local state rather than the (now effectively
+static) route prop, so conversation history correctly starts loading
+the moment the id is adopted rather than never. Re-ran the same
+diagnostic script against the fix: the URL updates with no content
+drop at any sampled instant. Added a permanent regression test to
+`smoke.spec.ts` that samples the message area through the exact
+adoption window and fails if it ever reverts to the idle empty state
+after showing the turn — proved non-vacuous by running it against the
+pre-fix code first (failed, reproducing the exact symptom) before
+confirming it passes against the fix. Full pipeline and a from-scratch
+fresh clone's Gate 6 run both clean afterward.
+
+### D6.7 — Gate 6's smoke test flaked on a genuinely cold run: too tight a per-test timeout, not an app bug
+
+Re-running Gate 6 from a truly fresh clone (no `.next-e2e` build cache,
+simulating what every real CI run looks like — CI's `reuseExistingServer:
+false` means every run starts this cold, not just the first one ever)
+reproducibly hit Playwright's default per-test timeout at whatever step
+happened to be running when the budget ran out — not the same step
+twice in a row, which was itself the tell that this wasn't a logic bug
+in one place. Root cause: the one smoke test walks roughly seven
+distinct routes, and Next's dev server compiles each on first request;
+against a genuinely cold `.next-e2e` that compile overhead alone
+(confirmed by timing repeated fully-cold runs, consistently 30-36s
+total) left no margin under the original 30-second test timeout,
+which real per-request latency (Postgres, real embedding/chat calls
+through the mock provider, SSE streaming) then reliably pushed over.
+
+Fixed by raising the test timeout to 90 seconds — generous enough to
+absorb a cold compile pass without masking an actual hang, since a
+truly broken flow still fails within that budget rather than needing
+the full 90s to prove it's broken. Verified by deleting `.next-e2e` and
+re-running from-scratch three times in a row: consistently green,
+34-36s each, comfortably under the new budget.

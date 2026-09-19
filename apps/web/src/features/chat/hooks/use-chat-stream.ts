@@ -77,9 +77,11 @@ export interface SendChatInput {
  * Drives one turn of POST /chat/stream at a time. `conversationId` is
  * whatever the caller currently has (undefined for a brand-new
  * conversation); `onStarted` fires as soon as the `start` event reports
- * the server-assigned conversationId, so the /chat page can
- * `router.replace` to /chat/[conversationId] immediately rather than
- * waiting for the whole answer to finish.
+ * the server-assigned conversationId, so the caller can adopt it
+ * immediately rather than waiting for the whole answer to finish — see
+ * chat-view.tsx's own doc comment for why that adoption must NOT be a
+ * real Next.js navigation (it would unmount this hook's instance
+ * mid-stream) and instead updates local state plus the URL bar directly.
  */
 export function useChatStream(conversationId: string | undefined, onStarted?: (conversationId: string) => void) {
   const [state, dispatch] = useReducer(reducer, IDLE_STATE);

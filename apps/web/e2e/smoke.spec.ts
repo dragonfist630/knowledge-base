@@ -54,20 +54,45 @@ test("full walkthrough: signup, documents, chat, usage, mobile nav", async ({ pa
   await test.step("ask a question in chat and get a streamed, cited answer", async () => {
     await page.getByRole("link", { name: "Chat" }).click();
     await expect(page).toHaveURL(/\/chat$/);
-    await page.getByPlaceholder("Ask a question about your documents…").fill("What is this knowledge base for?");
+    const question = "What is this knowledge base for?";
+    await page.getByPlaceholder("Ask a question about your documents…").fill(question);
     await page.getByRole("button", { name: "Send message" }).click();
+
+    // Regression guard for D6.6: adopting the server-assigned
+    // conversationId (via chat-view.tsx's handleStarted, right after the
+    // `start` SSE event) used to be a real Next.js navigation
+    // (router.replace), which unmounted ChatView — and the in-flight
+    // useChatStream instance with it — mid-turn, so the message area
+    // silently went blank until a background refetch pulled the finished
+    // answer back in later. Sampling the message area's text length
+    // through that exact adoption moment catches a regression back to
+    // that behavior: it must never drop to empty once non-empty, and the
+    // user's own question (rendered optimistically, independent of the
+    // stream) must stay visible throughout.
+    const messageArea = page.locator('div[aria-live="polite"].overflow-y-auto');
+    const EMPTY_STATE = "Ask a question about your documents to get started.";
+    let sawTurn = false;
+    for (let i = 0; i < 40; i++) {
+      const text = await messageArea.innerText().catch(() => "");
+      const hasTurn = text.includes(question); // the user's own message, rendered optimistically and independent of the stream.
+      if (hasTurn) {
+        sawTurn = true;
+      } else if (sawTurn) {
+        // Was showing the turn a moment ago, now shows neither the
+        // question nor its answer — exactly what a mid-stream remount
+        // (D6.6) does: it resets to the composer's idle empty state.
+        throw new Error(`message area reverted to "${text || EMPTY_STATE}" at sample ${i} after already showing the turn`);
+      }
+      if (/\/chat\/[^/]+$/.test(page.url()) && sawTurn) break;
+      await page.waitForTimeout(100);
+    }
+    expect(sawTurn, "message area never showed the sent question").toBe(true);
     await expect(page).toHaveURL(/\/chat\/[^/]+$/, { timeout: 15_000 });
+
     // MockChatModel deterministically echoes the question back with citation
     // markers appended (see docs/DECISIONS.md Phase 5) — the exact text
     // isn't the point, getting *any* real streamed+persisted assistant turn is.
-    // Scoped to the message list's own element (features/chat/components/message-list.tsx),
-    // not just `[aria-live="polite"]` — sonner's toast region also carries
-    // that attribute, and `.overflow-y-auto` is the message list's own
-    // distinguishing class among the two.
-    await expect(page.locator('div[aria-live="polite"].overflow-y-auto')).toContainText(
-      "What is this knowledge base for?",
-      { timeout: 20_000 },
-    );
+    await expect(messageArea).toContainText(question, { timeout: 20_000 });
   });
 
   await test.step("usage page reflects real recorded token counts", async () => {

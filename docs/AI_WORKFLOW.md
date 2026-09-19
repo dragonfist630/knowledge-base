@@ -421,3 +421,46 @@ browser driving a real, populated TanStack Query cache through the
 actual edit flow. Fixed by giving list queries their own dedicated
 cache-key prefix, verified by re-running the now-green smoke test and
 the full 19-task pipeline (D6.5).
+
+Asked again — "validate if Phase 6 is really done" — pushed to c63ec82
+and re-checked from three independent angles, not just "run it again."
+First, a fresh clone plus a from-scratch Gate 6 run (deleting the
+`.next-e2e` build cache to simulate what every real CI run actually
+looks like, not the warm-cache runs earlier verification had relied
+on) reproducibly timed out mid-suite — not at the same step twice,
+which pointed at a budget problem rather than a logic bug. Traced to
+Next's dev server compiling each of the smoke test's ~7 routes on
+first request, which a cold `.next-e2e` cache has no head start on;
+raised the per-test timeout from 30s to 90s and confirmed three
+fully-cold runs in a row landed comfortably inside it (D6.7).
+
+Second, dispatched an independent subagent with no memory of this
+session to adversarially read the Phase 6 frontend for the same class
+of bug D6.5 had just found — state silently lost across a
+discontinuity the code assumed was continuous. It found one: a
+brand-new conversation's `router.replace` from `/chat` to
+`/chat/[id]`, fired the instant the SSE `start` event reported the
+server-assigned id (the very first event of every turn), was a real
+Next.js navigation between two separate route files — unmounting the
+in-flight `useChatStream` instance mid-stream, so every subsequent
+token, citation, and even a mid-turn error were dispatched into a dead
+component and silently dropped. Verified personally rather than taking
+the report on faith: read the actual files, confirmed no shared layout
+sits between the two chat routes, then wrote a diagnostic script
+polling the message area through a live send — it reproduced the exact
+symptom, content visibly reverting right as the URL flipped. Fixed by
+adopting the conversation id as local state and updating the address
+bar with `history.replaceState` instead of a real navigation, so the
+component never unmounts. Added a permanent regression test and proved
+it wasn't vacuous the same way D5.9/D5.10 did: ran it against the
+pre-fix code first (failed, same symptom) before confirming it passed
+against the fix (D6.6).
+
+Third, ran the full pipeline and Gate 6 suite clean from that same
+fresh clone one more time after both fixes, then transferred, verified
+again on the Mac, committed, and pushed. Verdict: Phase 6 had two real
+gaps this pass — one a genuine app bug (D6.6), one a test-harness
+robustness gap that would have made CI flaky rather than the app itself
+wrong (D6.7) — both fixed, both covered by regression tests proven
+non-vacuous, both confirmed via a truly fresh clone rather than the
+same working directory that had already seen the fix applied.

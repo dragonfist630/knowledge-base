@@ -35,7 +35,16 @@ const REPO_ROOT = path.resolve(__dirname, "../..");
 
 export default defineConfig({
   testDir: "./e2e",
-  timeout: 30_000,
+  // Generous on purpose: the one smoke test walks ~7 distinct routes, and
+  // Next's dev server compiles each on first request. Against a genuinely
+  // cold `.next-e2e` (a fresh CI checkout, every time — there's no warm
+  // cache to reuse), that compile overhead alone reproducibly pushed the
+  // walkthrough past a tighter 30s budget in testing, failing wherever the
+  // test happened to be (not at any one consistent step), even though
+  // nothing was actually wrong. 90s comfortably absorbs a cold compile
+  // pass without hiding a real hang — the test still fails fast on a truly
+  // broken flow well before that.
+  timeout: 90_000,
   expect: { timeout: 10_000 },
   fullyParallel: false,
   forbidOnly: !!process.env.CI,
