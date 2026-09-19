@@ -1833,3 +1833,38 @@ Fixed by setting `major_version = 15` — the CLI's own documented
 default and the version this project's migrations/RLS work (Phase 1)
 and Gate 3's Postgres-substitute e2e harness were actually developed
 and validated against.
+
+### D6.10 — Workspace packages' `tsup --watch` cleaned `dist` on every rebuild, racing `apps/api`'s watch compiler
+
+D6.8 fixed the *first* startup race (apps/api's watch compiler loading
+`@kb/shared` before its very first build finished) by making `turbo
+dev`'s `dev` task depend on `^build`. Re-running `pnpm dev` after that
+fix still hit the same class of error — this time against `@kb/ai`:
+`TS7016: Could not find a declaration file for module '@kb/ai'`, with
+`packages/ai/dist/index.d.ts` confirmed present and correct moments
+later.
+
+Root cause: every workspace package's `tsup.config.ts` had `clean:
+true` unconditionally, including under `tsup --watch`. tsup honors
+`clean` on *every* rebuild it runs in watch mode, not just the first —
+so each package's own persistent `dev` script (`tsup --watch`, started
+by `turbo dev` alongside `apps/api`'s and `apps/web`'s dev servers)
+deletes and regenerates its `dist/` on every rebuild, including its
+initial one. D6.8's `dependsOn: ["^build"]` only orders the one-shot
+`build` task before dependents start `dev` — it has no way to also
+order a dependency's own long-running `dev` (watch) task, so nothing
+stops `@kb/ai#dev`'s first `tsup --watch` cycle from clearing
+`packages/ai/dist` at (or after) the same moment `apps/api#dev` starts
+compiling against it. Whichever package's watcher happened to be
+slowest to finish that first cycle looked "broken"; it varied by run
+(D6.8 saw it hit `@kb/shared`, this run hit `@kb/ai`) because it's pure
+scheduling timing, not a per-package bug.
+
+Fixed by making `clean` conditional on tsup's own `options.watch` flag
+(`clean: !options.watch`) in all three workspace packages'
+`tsup.config.ts` (`shared`, `rag-core`, `ai`) — a one-shot `build` still
+wipes `dist` first (as it should, to catch stale/renamed output files),
+but `--watch` mode never deletes `dist` mid-session, so a consumer
+compiling at any point during `turbo dev` — at startup or after a later
+source edit — always sees a complete, valid package rather than a
+directory that's momentarily empty or mid-rewrite.
