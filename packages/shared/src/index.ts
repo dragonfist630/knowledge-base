@@ -11,9 +11,11 @@
  *   - Phase 3: `documents.ts` (DocumentCreate/Update/List schemas)
  *   - Phase 5: `chat-events.ts` (the ChatEvent discriminated union) and
  *     `conversations.ts` (chat request + conversation/message DTOs)
+ *   - Phase 6: `meta.ts` (the /meta/ai provider-badge response shape) and
+ *     `usage.ts` (the /usage page's response shape)
  */
 
-export const KB_SHARED_VERSION = "0.4.0-phase5";
+export const KB_SHARED_VERSION = "0.5.0-phase6";
 
 export type { Database, Json, Tables, TablesInsert, TablesUpdate, Enums, CompositeTypes } from "./database.types.js";
 export { Constants } from "./database.types.js";
@@ -71,3 +73,9 @@ export type {
   MessageStatus,
   RetrievalDebug,
 } from "./conversations.js";
+
+export { AiDescriptorSchema, AiInfoResponseSchema } from "./meta.js";
+export type { AiInfoResponse } from "./meta.js";
+
+export { UsageQuerySchema, UsageOperationSchema, UsageDayRowSchema, UsageTotalsSchema, UsageSummaryResponseSchema } from "./usage.js";
+export type { UsageQuery, UsageOperation, UsageDayRow, UsageTotals, UsageSummaryResponse } from "./usage.js";

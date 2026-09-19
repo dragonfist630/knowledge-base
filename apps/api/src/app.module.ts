@@ -17,6 +17,7 @@ import { DocumentsModule } from "./documents/documents.module.js";
 import { IndexingModule } from "./indexing/indexing.module.js";
 import { MetaModule } from "./meta/meta.module.js";
 import { RetrievalModule } from "./retrieval/retrieval.module.js";
+import { UsageModule } from "./usage/usage.module.js";
 
 @Module({
   imports: [
@@ -49,6 +50,7 @@ import { RetrievalModule } from "./retrieval/retrieval.module.js";
     RetrievalModule,
     ChatModule,
     MetaModule,
+    UsageModule,
   ],
   providers: [
     // Order matters: AuthGuard must populate req.auth before

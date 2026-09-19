@@ -1481,3 +1481,215 @@ end-to-end version that runs the real `chunkDocument()` output through
 hand-crafted one. Re-ran the full pipeline and e2e suite from the same
 clone: clean throughout, 56/56 unit tests (up from 54), 26/26 e2e —
 nothing else regressed.
+
+### D5.11 — Third re-validation pass, mid-Phase-6: still clean
+
+Asked again, from inside Phase 6, whether Phase 5 was "really done,
+without gaps or bugs" — the fourth time this question has been put to
+Phase 5 specifically (D1.5-style initial pass folded into D5.9's first
+half, then D5.9/D5.10's two real bugs, now this). Dispatched to an
+independent subagent with no memory of D5.9/D5.10's fixes, instructed
+to read `RetrievalService`, `ChatService`, `prompt.ts`, and their specs
+adversarially and report anything it found, then cross-checked its
+report personally against the actual source rather than trusting the
+summary. Confirmed: both D5.9 fixes (`continue` not `break` in
+`packContext`; `persistError` calling `touch()`) and D5.10's fix
+(`headingPath` equality in `mergeAdjacent`) are all still in place and
+covered by their regression tests; no new issues surfaced. Full
+pipeline clean (43/43 `@kb/rag-core`, 56/56 `apps/api` at the time).
+Verdict: Phase 5 remains genuinely done — this pass didn't repeat
+D5.9/D5.10's value because there was nothing left to find, which is
+itself the useful confirmation.
+
+## Phase 6
+
+### D6.1 — Web app architecture: TanStack Query owns server state, a hand-rolled Sheet nav over shadcn's Sidebar, `use()` over `useSearchParams()` where possible
+
+Three small, related choices that show up as doc comments throughout
+`apps/web/src`, worth recording once instead of re-justifying at each
+call site.
+
+Server state (documents, conversations, usage) lives entirely in
+TanStack Query — no separate client-side store duplicating it, no
+prop-drilled cache. Lists that can still be indexing poll (`useDocuments`,
+`useDocument`) only while at least one loaded row is `pending`/`indexing`,
+stopping once everything's terminal, rather than polling unconditionally
+or requiring a manual refresh — the same "live enough without
+Realtime" tradeoff the brief calls out as acceptable.
+
+The `(app)` route group's shell (`layout.tsx`) is a small hand-rolled
+sidebar that collapses into a Radix `Sheet` on mobile, not shadcn's
+full `Sidebar` primitive — that component's collapsible-rail and
+cookie-persisted open/closed state is built for apps with far more nav
+sections than this one's fixed three (Documents/Chat/Usage), and would
+have added machinery with nothing to actually use it for.
+
+Client Component pages that receive `params`/`searchParams` as props
+(`/documents/[id]`, `/chat`) read them with React's `use()` on the
+promises Next passes, per Next's own documented pattern for Client
+Component pages — not the `useSearchParams()` hook, which needs a
+Suspense boundary wrapper to avoid de-opting the whole page into
+client-only rendering. The one exception is `/login`, which already
+needs `useSearchParams()` for its `redirectTo` param and takes the
+Suspense-wrapper cost there since `use()` isn't an option for a page
+that's `"use client"` all the way up with no Server Component parent
+handing it the promise.
+
+One documented, intentional gap in the document editor
+(`document-form.tsx`): a dirty draft is protected from being lost via a
+native `beforeunload` handler (warns on tab close, refresh, or a typed
+URL navigation) but not via any in-app navigation guard — Next.js's App
+Router has no stable client-side navigation-blocking API as of this
+phase, so clicking an in-app `<Link>` away from a dirty editor isn't
+intercepted. Noted rather than silently accepted, so a future App
+Router release that adds one has a clear place to wire it in.
+
+### D6.2 — Next 16's dev server hangs forever mid-hydration in this sandbox (`experimental.reactDebugChannel`)
+
+Asked to validate Phase 5 with real UI screenshots (not the DOM/HTML
+captures earlier phases had relied on), every screenshot came back
+looking right — until the first attempt to actually click something
+(a dropdown, a tag filter) did nothing. The rendered HTML was correct
+and complete; the page was simply inert, with no console error and no
+network activity to explain it.
+
+Traced it by reading the compiled client bundle, then the unminified
+`next/dist/client/app-index.js`: Next 16's dev server defaults
+`experimental.reactDebugChannel` to `true`, and client hydration
+`await`s a WebSocket-based "debug channel" as part of resolving the
+initial RSC payload, before `hydrateRoot()` is ever called. That
+WebSocket handshake never completes in this sandbox specifically —
+confirmed with a standalone probe: a bare `new WebSocket(...)` to the
+dev server's own `/_next/hmr` endpoint fails from a Chromium/Playwright
+context while the identical handshake succeeds via `curl`, and a
+trivial unrelated `ws` server works fine from the same browser — so
+it's this sandbox's proxying of Next's specific dev-server WebSocket
+implementation, not a general WebSocket, CORS, or IndexedDB problem.
+With hydration permanently blocked on a channel that will never open,
+the app stays server-rendered HTML forever: correct-looking, completely
+non-interactive, silent about why.
+
+Fixed with `experimental: { reactDebugChannel: false }` in
+`next.config.ts`, removing hydration's dependency on that channel
+entirely. Verified fixed by checking for React fiber props on hydrated
+DOM nodes and confirming dropdown menus actually open on click, then
+captured all 19 requested UI screenshots against the now-genuinely-
+interactive app. Worth carrying forward: this is a real, reportable
+Next 16 dev-server behavior that could bite any sandboxed, proxied, or
+CI environment where a WebSocket to the dev server's own origin doesn't
+round-trip cleanly, not something specific to this repo.
+
+### D6.3 — Usage page: one RPC, `security invoker`, grouped by (day, operation, model)
+
+Built to the brief's own shape: a `usage_summary(p_from timestamptz)`
+Postgres RPC (`security invoker`, filtering by `auth.uid()` like every
+other query in this codebase, added in the Phase 1 migration file)
+returns `ai_usage_events` grouped by day/operation/model with
+prompt/completion/total token sums and an event count. `UsageService`
+just calls it and sums the rows into overall totals — no new
+aggregation logic duplicated between the DB and the app layer. The
+frontend (`UsageView`) is a day-range selector (7/30/90) over four
+stat tiles plus a "by model" breakdown table, built the same way as
+every other feature in this phase: a TanStack Query hook
+(`useUsage`) wrapping `apiFetch`, no separate store.
+
+### D6.4 — `scripts/seed.mjs`: plain REST calls to Auth, not the Supabase JS SDK
+
+Rewritten from its Phase 0 placeholder to actually create a demo user
+(`demo@example.com`) and three sample documents through the real API,
+so they go through the real indexing pipeline rather than being
+inserted directly. Talks to Supabase Auth's REST endpoints
+(`/auth/v1/signup`, `/auth/v1/token?grant_type=password`) with plain
+`fetch`, not the Supabase JS SDK — this is a one-shot Node script, not
+a long-lived client with a session to manage, and the SDK's main value
+(token refresh, storage) doesn't apply here. Idempotent: a second run
+signs the existing demo user back in instead of failing on "already
+registered," and re-creates the three sample documents (POST
+`/documents` has no title-uniqueness constraint, so this is
+intentionally harmless to repeat, not something worth guarding
+against). Loads the repo's root `.env` with Node 22's built-in
+`process.loadEnvFile`, avoiding a `dotenv` dependency that isn't
+hoisted to the repo root.
+
+### D6.5 — Gate 6: a real browser, a real backend, no mocks — and the real bug that only that combination could catch
+
+Built the same way Gate 3's e2e harness works (D3.1) — no Docker, a
+real Postgres reachable as superuser, `bootstrap.sql`'s auth shim plus
+the unmodified `supabase/migrations/*.sql`, a real PostgREST binary —
+but extended with one new piece Gate 3 never needed:
+`apps/web/e2e/support/auth-gateway.ts`, a small GoTrue-compatible shim
+in front of PostgREST. Gate 3's e2e suite only ever needed a
+hand-minted JWT, because `AuthGuard` has a local-HS256 verification
+fallback; Gate 6 drives a real browser through `apps/web`, and
+`@supabase/ssr`'s browser client calls `supabase.auth.getUser()` in
+the app's own layout and proxy — which, per Supabase's documented
+behavior, always makes a live round trip to `${SUPABASE_URL}/auth/v1/user`
+to revalidate server-side, unlike the local/cookie-only `getSession()`.
+Without something answering that endpoint the whole app hangs waiting
+on it forever, so `auth-gateway.ts` answers signup/password-grant/
+logout/get-user with real sessions signed with the same well-known
+local secret PostgREST and `AuthGuard`'s fallback both already use,
+and proxies `/rest/v1/*` straight through to real PostgREST.
+
+One ordering subtlety worth recording: Playwright starts `webServer`
+entries *before* running `globalSetup`, not after — confirmed by
+reading the test runner's own task list rather than assuming. That
+means every value a `webServer` needs (ports, the JWT secret, the
+gateway URL apps/api and apps/web should point `SUPABASE_URL` at) has
+to be a fixed constant available at config-load time, not something
+`globalSetup` computes — hence `e2e/support/constants.ts` as the one
+shared source of fixed ports/secrets both `playwright.config.ts` and
+`global-setup.ts` import, rather than dynamic port allocation. Since
+neither apps/api nor apps/web touches Supabase at process boot (only
+per-request), the two servers coming up before the database/PostgREST/
+gateway stack finishes setting up is harmless — nothing is called until
+a test actually runs, by which point both tasks have completed.
+
+Writing the actual smoke test (signup → load sample documents → wait
+for indexing → open, edit, and save a document → ask a question in
+chat → check the usage page → sign out/in → delete the document →
+check mobile nav) surfaced a real, previously-undetected bug on the
+very first run: saving an *existing* document silently did nothing.
+The click registered, `handleSave` ran, but `save.mutateAsync` threw
+`TypeError: Cannot read properties of undefined (reading 'map')` before
+any network request was even sent — caught only by adding a temporary
+`console.log` at the top of `handleSave`, since the failure was
+swallowed into a `toast.error` that had already auto-dismissed by the
+time the test's own timeout fired. Root cause: `useSaveDocument`'s
+optimistic-update `onMutate` calls `queryClient.setQueriesData({
+queryKey: documentsKeys.all }, ...)` with an updater that assumes
+`InfiniteData<DocumentListResponse>` shape (`data.pages.map(...)`) —
+but `documentsKeys.all` (`["documents"]`) is a prefix of *both* the list
+queries' key and `documentsKeys.detail(id)`'s key, so React Query's
+partial-key matching applies that same updater to the plain
+`DocumentDetail` object cached for the currently-open document too.
+That object has no `.pages`, so the updater throws — before the
+`mutationFn` (the actual PATCH) ever runs. This bug existed for every
+edit-and-save of an already-existing document; it was never caught by
+unit tests (which construct isolated fake query clients, never one
+with both a list and a matching detail entry populated together) or by
+earlier manual screenshot passes (which exercised *creating* documents,
+whose `id`-less mutation path skips this block of `onMutate` entirely).
+Only a real browser driving a real, live TanStack Query cache through
+the actual edit-an-existing-document flow could have surfaced it.
+
+Fixed by giving list queries their own dedicated partial key,
+`documentsKeys.lists = ["documents", "list"]`, distinct from `.detail`,
+and scoping both the optimistic updater and its `previousLists`
+snapshot to `.lists` instead of the too-broad `.all`. Verified by
+re-running the smoke test (now green, save round-trips for real) and
+the full pipeline (`lint typecheck build test --force`, 19/19 tasks,
+including apps/api's own 61/61 unit tests, confirming nothing else
+depended on the old, accidentally-broad matching). Also worked around
+two sandbox-specific, non-app issues hit while building this harness:
+apps/web's tsconfig pulls in the DOM `lib`, so `fetch`'s `Response.body`
+resolves to a DOM `ReadableStream` type incompatible with
+`node:stream/promises`'s `pipeline` — bridged with `Readable.fromWeb`
+plus an explicit cast, since the two lib.d.ts's `ReadableStream`
+declarations aren't structurally identical even though the runtime
+object is the same undici stream either way; and Next's dev server
+refuses to start a second instance against the same project directory
+even on a different port (its lock lives in `.next/`, keyed by
+directory) — resolved with a `NEXT_DIST_DIR` env var routing Gate 6's
+own `next dev` to a separate `.next-e2e` build directory, leaving a
+person's own `:3000` dev server (and its lock) untouched.

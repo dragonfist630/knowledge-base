@@ -353,3 +353,71 @@ and one end-to-end test built on the real chunker output, since a
 hand-crafted fixture alone wouldn't have proven the fix addresses what
 production actually does (D5.10). Full pipeline and e2e suite both
 clean afterward.
+
+Asked one more time, mid-Phase-6, whether Phase 5 held up — dispatched
+to a fresh subagent with no memory of D5.9/D5.10's fixes, cross-checked
+personally. Both fixes still in place, still covered by their tests, no
+new issues (D5.11). Fourth time this exact question has been asked of
+Phase 5; fourth time the answer required actually checking rather than
+assuming yesterday's "yes" still holds.
+
+## Phase 6 — the web UI, Usage, seeding, and Gate 6
+
+Built the Next.js App Router frontend the brief's Phase 6 spec
+describes — auth (signup/login/logout via `@supabase/ssr`), documents
+CRUD with a Markdown write/preview editor, chat with SSE streaming and
+inline citations, and a responsive shell that collapses to an
+off-canvas nav on mobile — against TanStack Query as the one place
+server state lives, matching the state-management rule the rest of the
+app already follows (D6.1).
+
+Asked to validate Phase 5 again, this time with real UI screenshots
+rather than DOM captures, every screenshot looked correct — until the
+first attempted click did nothing at all. Traced it to a genuine Next
+16 dev-server gotcha: `experimental.reactDebugChannel` defaults to
+`true`, and client hydration awaits a WebSocket "debug channel" whose
+handshake never completes in this sandbox specifically (proved with a
+standalone WebSocket probe, ruling out CORS/IndexedDB/general
+WebSocket brokenness) — so the app stays server-rendered HTML forever,
+looking right and doing nothing, with zero console error to explain
+why. Fixed with one config flag, verified by checking for hydrated
+React fiber props and confirming a dropdown actually opens, then
+captured all 19 requested screenshots against a genuinely interactive
+app (D6.2). Also ran a third independent re-validation pass on Phase 5
+itself during this same stretch of work (folded into D5.11 above,
+Phase 5's own section) — still clean.
+
+Asked next whether to "move on to the next phase" — answered with a
+clarifying question rather than guessing, since the brief has no Phase
+7 and Phase 6 itself wasn't finished yet (no Usage page, `seed.mjs`
+still a placeholder, no Gate 6). Given the choice to finish Phase 6
+first, in order: the backend `UsageModule` (one `security invoker` RPC,
+grouped by day/operation/model, summed in the service layer, not
+duplicated across the DB and app — D6.3) and its frontend page; then
+`scripts/seed.mjs`, rewritten from its Phase 0 placeholder to talk
+directly to Supabase Auth's REST endpoints and create real sample
+documents through the real indexing pipeline (D6.4).
+
+Closed with Gate 6: a real Chromium session driven by Playwright
+against a real apps/api, real PostgREST/RLS, and one new piece of test
+infrastructure Gate 3 never needed — a GoTrue-compatible auth shim,
+because apps/web's browser Supabase client makes a live `/auth/v1/user`
+round trip on every auth check, unlike apps/api's own local-JWT
+fallback (D6.5). The very first run of the resulting smoke test — sign
+up, load and index sample documents, open and edit and save one, ask a
+question in chat, check the usage page, sign out and back in, delete
+the document, check mobile nav — caught a real, previously-undetected
+production bug on its very first pass: saving an *already-existing*
+document silently failed every time. Traced with a temporary debug log
+(the failure was being swallowed into a toast that auto-dismissed
+before the test's own assertion timeout fired) to a query-cache-key
+collision: an optimistic-update helper matched both the document list
+queries and the single open document's own cache entry under the same
+overly-broad key, then crashed trying to treat the single document like
+a paginated list. Neither the unit tests (isolated fake query clients)
+nor the earlier manual screenshot pass (which exercised *creating* a
+document, a different code path) could have caught this — only a real
+browser driving a real, populated TanStack Query cache through the
+actual edit flow. Fixed by giving list queries their own dedicated
+cache-key prefix, verified by re-running the now-green smoke test and
+the full 19-task pipeline (D6.5).
