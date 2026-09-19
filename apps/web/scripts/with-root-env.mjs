@@ -1,31 +1,34 @@
 #!/usr/bin/env node
 /**
- * Loads the monorepo's single root `.env` into this process's *real*
- * environment, then runs the command that follows, so the child process
- * inherits those values as genuine `process.env` entries.
+ * Puts the monorepo's single root `.env` into the real environment before
+ * running `next`, so the values are already there rather than being applied
+ * later as a mutation. `apps/web`'s `dev`, `build` and `start` scripts all
+ * run `next` through this.
  *
- * Why this exists, given next.config.ts already calls `loadEnvConfig` on
- * the same root: that call populates `process.env` inside whichever
- * process evaluates the Next config, and every ordinary part of the app
- * (pages, server components, route handlers, the browser bundle) reads
- * those values fine. `src/proxy.ts` does not. Next 16 renamed
- * `middleware.ts` to `proxy.ts` and its docs are explicit that Proxy "is
- * meant to be invoked separately of your render code" and that you
- * "should not attempt relying on shared modules or globals" — Turbopack
- * builds and runs it apart from the rest of the app, and in that context
- * a `process.env` mutation performed by application config simply isn't
- * visible. The result was `createServerClient` receiving `undefined` for
- * both Supabase arguments on every single request, while the identical
- * `loadEnvConfig` call verified correct in isolation and the root `.env`
- * was confirmed correct on disk. Putting the values in the environment
- * *before* `next` starts sidesteps the question entirely: there is no
- * mutation to propagate, because the variables are already there.
- * See docs/DECISIONS.md Phase 6, D6.11.
+ * Why it exists: `next.config.ts` also calls `loadEnvConfig` on the same
+ * root, and every ordinary part of the app reads the result fine, but
+ * `src/proxy.ts` does not. Next 16 renamed `middleware.ts` to `proxy.ts`
+ * and its docs are explicit that Proxy "is meant to be invoked separately
+ * of your render code" and that you "should not attempt relying on shared
+ * modules or globals" — Turbopack builds and runs it apart from the rest
+ * of the app, where a `process.env` mutation performed by application
+ * config isn't visible. Loading the file out here removes the question:
+ * there is no mutation to propagate. See docs/DECISIONS.md Phase 6, D6.11.
  *
- * `loadEnvConfig` does not overwrite variables already present in the
- * environment, so an explicit `FOO=bar pnpm dev` — and Gate 6's
- * playwright `webServer.env`, which sets these same keys directly — still
- * take precedence over the file.
+ * Only `NEXT_PUBLIC_*` is taken from the file, because that is the whole
+ * of this app's contract with it — those four values are the only ones
+ * `apps/web` reads that the file supplies. The rest of the root `.env`
+ * configures apps/api and the scripts (`PORT`, `SUPABASE_SERVICE_ROLE_KEY`,
+ * the `AI_*` provider block, `NODE_ENV`, ...), and handing that to `next`
+ * does real damage: `PORT=3001` made `next dev` bind the API's port
+ * (D6.12), and `NODE_ENV=development` made `next build` produce a
+ * development build that then crashed while prerendering (D6.13). Both
+ * were the same mistake — passing a process more than it asked for — so
+ * this allowlists rather than blocking known-bad names one at a time.
+ *
+ * Nothing already present in the real environment is touched, so
+ * `PORT=3100 pnpm dev`, `CI=1`, and Gate 6's playwright `webServer.env`
+ * (which sets these same keys directly) all still win over the file.
  */
 
 import { spawn } from "node:child_process";
@@ -33,27 +36,21 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { resolveWebEnv } from "./root-env.mjs";
+
 const require = createRequire(import.meta.url);
 const { loadEnvConfig } = require("@next/env");
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(here, "../../..");
 
-// `PORT` in the root `.env` belongs to apps/api (see .env.example). Next
-// also honours `PORT`, so injecting the file wholesale would make
-// `next dev` bind the API's port and leave apps/api dead on
-// `EADDRINUSE`. Anything genuinely exported in the surrounding shell is
-// the developer's explicit intent and is left alone; a value that came
-// only from the file is dropped, so Next falls back to its own default
-// (3000). Set `WEB_PORT` in the root `.env` to move the web app instead.
-const portWasExplicit = Object.hasOwn(process.env, "PORT");
+const inheritedEnv = { ...process.env };
+const { combinedEnv } = loadEnvConfig(REPO_ROOT);
 
-loadEnvConfig(REPO_ROOT);
-
-if (!portWasExplicit) {
-  delete process.env.PORT;
-  if (process.env.WEB_PORT) process.env.PORT = process.env.WEB_PORT;
-}
+// loadEnvConfig applies the whole file to this process's own env; the
+// child gets only what resolveWebEnv allows through (see root-env.mjs,
+// and root-env.test.mjs for the regressions it exists to prevent).
+const childEnv = resolveWebEnv(inheritedEnv, combinedEnv ?? {});
 
 const [command, ...args] = process.argv.slice(2);
 if (!command) {
@@ -63,7 +60,7 @@ if (!command) {
 
 const child = spawn(command, args, {
   stdio: "inherit",
-  env: process.env,
+  env: childEnv,
   // `next` is a .cmd shim on Windows, which bare spawn can't execute.
   shell: process.platform === "win32",
 });

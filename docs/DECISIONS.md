@@ -1962,3 +1962,37 @@ a change to how that process gets its environment. A new failure
 arriving with a new change is a regression until proven otherwise, and
 the cheap check (what does the child actually receive?) took one command
 and settled it immediately.
+
+### D6.13 — the D6.11 wrapper leaked NODE_ENV too, so `next build` produced a crashing development build
+
+Found by a full clean-clone audit, not in normal use: `pnpm build` from a
+fresh checkout failed while prerendering `/_global-error` with
+`TypeError: Cannot read properties of null (reading 'useContext')`. Bisected
+to the D6.11 wrapper — the build passed at the commit before it and failed
+after — and confirmed by forcing `NODE_ENV=production`, which made the build
+pass.
+
+Root cause: exactly the D6.12 mistake, one variable over. `with-root-env.mjs`
+injected the *entire* root `.env` into `next`, and that file carries
+`NODE_ENV=development` (it is apps/api's, loaded by dotenv there). Next honours
+`NODE_ENV`, so `next build` produced a development build whose client runtime
+then crashed during static prerender. D6.12 had removed `PORT` specifically;
+this was the same class of defect with a different key, which is the signal
+that block-one-name-at-a-time was the wrong shape of fix.
+
+Fixed by inverting it into an allowlist: the wrapper now takes only
+`NEXT_PUBLIC_*` from the file (plus an opt-in `WEB_PORT`), which is the whole
+of apps/web's contract with the root `.env`. Everything else in that file —
+`NODE_ENV`, `PORT`, `SUPABASE_SERVICE_ROLE_KEY`, the `AI_*` block — is
+apps/api's and no longer reaches `next`. Anything already exported in the real
+shell still wins, so Gate 6's `webServer.env` and an explicit `PORT=... pnpm dev`
+are unaffected.
+
+The allowlist decision is a pure function (`apps/web/scripts/root-env.mjs`) with
+a unit test (`root-env.test.mjs`) covering D6.11/D6.12/D6.13 and the
+precedence rules, proven non-vacuous against the pre-fix "inject everything"
+behaviour. Separately, `pnpm check:dev-boot` (`scripts/check-dev-boot.mjs`)
+now boots the app the way a person actually does — `pnpm dev`, reading the
+root `.env` off disk — and asserts a page renders, closing the gap noted in
+D6.11: Gate 6 passes `NEXT_PUBLIC_*` to its spawned `next dev` directly, so it
+never exercised root-`.env` loading and never could have caught D6.11/12/13.
