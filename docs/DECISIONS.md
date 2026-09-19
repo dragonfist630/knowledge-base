@@ -1925,3 +1925,40 @@ harness's env injection is still correct for its own purposes
 isn't closed by removing it; closing it properly means a separate,
 cheap check that boots the app the way a human does and asserts a page
 renders.
+
+### D6.12 — the D6.11 wrapper leaked `PORT` into `next dev`, so the web app stole the API's port
+
+Immediately after D6.11 landed, `pnpm dev` started failing with
+`EADDRINUSE: address already in use :::3001` from `apps/api` — an error
+that had never appeared before, and which looked convincingly like a
+stale process left over from the many restarts that debugging D6.11 had
+involved. It wasn't.
+
+`with-root-env.mjs` loads the *entire* root `.env` into the environment
+`next` inherits. That file's `PORT=3001` belongs to `apps/api` (it is
+documented as such in `.env.example`), but Next honours `PORT` too — so
+`next dev` bound 3001, and `apps/api`, starting moments later in the
+same `turbo dev` pipeline, found its own port taken. Before D6.11 this
+could not happen, because the root `.env` never reached Next at all;
+that was precisely the bug D6.11 fixed. Widening what a process can see
+widened what it acts on, which is the general hazard in passing a whole
+env file to something that didn't previously read it.
+
+Fixed in the wrapper: `PORT` is dropped when it came only from the file,
+so Next falls back to its own default of 3000, and `WEB_PORT` is
+available for moving the web app deliberately. A `PORT` that was
+genuinely exported in the surrounding shell is the developer's explicit
+intent and is left untouched.
+
+Worth recording as a process note, not just a code one: the first
+response to the `EADDRINUSE` was to treat it as environmental — leftover
+supervisors that `nest start --watch` kept respawning — and to start
+building a script that finds and kills whatever holds the dev ports.
+That script would have "worked", in that `pnpm dev` would have run
+afterwards, while leaving the actual defect in place and adding a
+process-killer to the repo to paper over it. The tell that should have
+landed sooner: the error appeared for the first time in the same run as
+a change to how that process gets its environment. A new failure
+arriving with a new change is a regression until proven otherwise, and
+the cheap check (what does the child actually receive?) took one command
+and settled it immediately.

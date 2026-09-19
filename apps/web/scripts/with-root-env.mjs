@@ -39,7 +39,21 @@ const { loadEnvConfig } = require("@next/env");
 const here = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(here, "../../..");
 
+// `PORT` in the root `.env` belongs to apps/api (see .env.example). Next
+// also honours `PORT`, so injecting the file wholesale would make
+// `next dev` bind the API's port and leave apps/api dead on
+// `EADDRINUSE`. Anything genuinely exported in the surrounding shell is
+// the developer's explicit intent and is left alone; a value that came
+// only from the file is dropped, so Next falls back to its own default
+// (3000). Set `WEB_PORT` in the root `.env` to move the web app instead.
+const portWasExplicit = Object.hasOwn(process.env, "PORT");
+
 loadEnvConfig(REPO_ROOT);
+
+if (!portWasExplicit) {
+  delete process.env.PORT;
+  if (process.env.WEB_PORT) process.env.PORT = process.env.WEB_PORT;
+}
 
 const [command, ...args] = process.argv.slice(2);
 if (!command) {
