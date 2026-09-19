@@ -1813,3 +1813,23 @@ install` (and thus every workspace package's build, via other commands
 run beforehand in that harness) had already completed — this race is
 specific to `turbo dev` being the very first command run after a fresh
 `node_modules`.
+
+### D6.9 — `supabase start` rejected the local config: `major_version = 16` isn't a version Supabase ships
+
+The first real `supabase start` run against this repo's `supabase/config.toml`
+(on a reviewer's actual machine, with Docker — the cloud sandbox this
+project was otherwise built in has no Docker, so this path was never
+exercised end to end until now; see this file's own header comment) failed
+immediately: `Failed reading config: Invalid db.major_version: 16.`
+
+Root cause: `[db] major_version` was set to `16`, but Supabase never
+shipped a Postgres 16 image — its local/hosted Postgres line went
+straight from 15 (LTS) to 17, skipping 16 entirely, and the CLI validates
+`major_version` against the versions it actually has images for. `16`
+was never a valid value here; it just happened to never get checked
+before because nothing had run `supabase start` against this file yet.
+
+Fixed by setting `major_version = 15` — the CLI's own documented
+default and the version this project's migrations/RLS work (Phase 1)
+and Gate 3's Postgres-substitute e2e harness were actually developed
+and validated against.
