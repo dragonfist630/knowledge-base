@@ -4,9 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start",
+    "dev": "node scripts/with-root-env.mjs next dev",
+    "build": "node scripts/with-root-env.mjs next build",
+    "start": "node scripts/with-root-env.mjs next start",
     "lint": "eslint",
     "typecheck": "next typegen && tsc --noEmit",
     "test:e2e": "playwright test",

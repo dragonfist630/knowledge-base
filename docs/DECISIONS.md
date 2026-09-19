@@ -1869,35 +1869,59 @@ compiling at any point during `turbo dev` — at startup or after a later
 source edit — always sees a complete, valid package rather than a
 directory that's momentarily empty or mid-rewrite.
 
-### D6.11 — `proxy.ts` still saw empty `NEXT_PUBLIC_SUPABASE_*` even with a correct root `.env` and a confirmed-working `loadEnvConfig` call
+### D6.11 — `proxy.ts` never saw the root `.env`: Next config's `process.env` mutation doesn't reach it
 
-With D6.8/D6.10 fixed and a genuinely fresh `pnpm dev` (confirmed by a
-clean `apps/api` boot log with none of the earlier TS errors), `apps/web`
-still threw `Your project's URL and Key are required to create a Supabase
-client!` from `src/proxy.ts`, every time, even after deleting `apps/web/.next`
-and restarting. Isolated the exact mechanism `next.config.ts` relies on —
-a standalone script that does nothing but call `loadEnvConfig(repoRoot)`
-and read `process.env.NEXT_PUBLIC_SUPABASE_URL` back — and it correctly
-returned the real local Supabase URL every time. So the root `.env` was
-correct, `loadEnvConfig` was correctly loading it, and `apps/web`'s pages
-worked fine — only `proxy.ts` specifically never saw it.
+`apps/web` threw `Your project's URL and Key are required to create a
+Supabase client!` from `src/proxy.ts` on every request, with a correct
+root `.env` on disk, local Supabase confirmed running, a from-scratch
+`apps/web/.next`, and a genuinely fresh `pnpm dev`.
 
-Root cause: Next 16 renamed `middleware.ts` to `proxy.ts` and changed its
-default runtime to Node.js, but its own file-convention docs still warn
-"Proxy is meant to be invoked separately of your render code... you
-should not attempt relying on shared modules or globals" — Turbopack
-compiles it as its own isolated bundle, and in this setup that
-compilation did not reliably inherit the plain `process.env` mutation
-`loadEnvConfig` performs as a side effect at the top of `next.config.ts`,
-even though every other part of the app (which Turbopack compiles
-through its normal, non-isolated path) picked the same mutation up fine.
+Two hypotheses were wrong and are recorded here because both looked
+plausible and cost a round trip each. First: a stale Turbopack build
+cache holding a `proxy.ts` chunk compiled before `.env` had values —
+disproved by deleting `apps/web/.next` and reproducing exactly.
+Second: `loadEnvConfig`'s values not being inlined into the Proxy
+bundle, "fixed" by also declaring the four `NEXT_PUBLIC_*` keys through
+`next.config.ts`'s `env` config key — disproved by reproducing exactly
+again, and reverted.
 
-Fixed by also declaring the four `NEXT_PUBLIC_*` values the app actually
-uses (`NEXT_PUBLIC_API_URL`, `NEXT_PUBLIC_SITE_URL`,
-`NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`) through
-Next's own `env` config key in `next.config.ts`, right after the
-`loadEnvConfig` call. `env` is Next's own supported mechanism for
-guaranteeing a value is inlined into every compilation target it
-produces — including an isolated bundle like `proxy.ts` — rather than
-depending on that target having independently picked up a `process.env`
-side effect performed elsewhere.
+What actually settled it was an experiment rather than another guess:
+`set -a; source .env; set +a` before `pnpm dev` — putting the same
+values in the shell's real environment instead of leaving Next to read
+the file — made the error disappear immediately. Combined with a
+standalone script that calls nothing but `loadEnvConfig(repoRoot)` and
+reads `process.env` back (which returned the right values every time),
+that isolates the fault precisely: the file is fine, the loader is
+fine, and every ordinary part of the app reads the loaded values fine —
+but `proxy.ts` does not. Next 16 renamed `middleware.ts` to `proxy.ts`
+and its docs are explicit that Proxy "is meant to be invoked separately
+of your render code" and that you "should not attempt relying on shared
+modules or globals". Turbopack builds and runs it apart from the rest
+of the app, and a `process.env` mutation performed by application
+config — which is exactly what `loadEnvConfig` in `next.config.ts` is —
+is not visible there.
+
+Fixed by loading the root `.env` into the real process environment
+*before* `next` starts, via `apps/web/scripts/with-root-env.mjs`, which
+`apps/web`'s `dev`, `build`, and `start` scripts now run `next` through.
+There is then no mutation that needs to propagate anywhere: the
+variables are already in the environment the Next process and all of
+its children inherit. `loadEnvConfig` stays in `next.config.ts` for
+anything that invokes `next` directly rather than through the package
+script, and because it never overwrites variables already present, an
+explicit `FOO=bar pnpm dev` still wins over the file.
+
+Why Gate 6 never caught this, which is the more useful lesson: its
+Playwright `webServer` entries pass `NEXT_PUBLIC_API_URL`,
+`NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` and
+`NEXT_PUBLIC_SITE_URL` to the spawned `next dev` directly as process env
+(see `playwright.config.ts`), so the harness has always run the app down
+the one path where this bug cannot occur, and has never once exercised
+root-`.env` loading. A green Gate 6 therefore said nothing about whether
+`pnpm dev` works for a person who just cloned the repo and ran
+`pnpm setup` — the single most likely first thing a reviewer does. The
+harness's env injection is still correct for its own purposes
+(hermetic ports, a throwaway database, the auth gateway), so the gap
+isn't closed by removing it; closing it properly means a separate,
+cheap check that boots the app the way a human does and asserts a page
+renders.
