@@ -2265,6 +2265,14 @@ changes; `pnpm ai:check` verified working immediately after a fresh
 
 ## Phase 8
 
+There is no Phase 7 in this project — the numbering jumps 6 to 8
+deliberately. Phase 6 was the post-launch audit; Phase 8 (this one) is the
+retrieval-quality eval harness; Phase 9 (architecture diagram, API
+reference, scaling notes) is still open. No commit, doc, or planning note
+anywhere in this repo's history defines a Phase 7 deliverable — confirmed
+by grepping the full history rather than assumed, after a request to
+validate it turned up nothing to validate.
+
 ### D8.1 — `pnpm eval`: a real-stack retrieval-quality harness, replacing the Phase 0 "not implemented" placeholder
 
 `scripts/eval-retrieval.mjs` was a 9-line stub since Phase 0 (confirmed
@@ -2379,15 +2387,44 @@ Large chunks — ~900 target tokens                  83%    94%   100%   0.90
 No heading breadcrumb in embedding input           83%    94%    94%   0.88
 ```
 
-Vector-only matching hybrid exactly on this corpus/config isn't
-surprising for the mock embedder specifically: it's a bag-of-words hasher,
-so semantic similarity and keyword overlap are highly correlated by
-construction (both ultimately measure shared vocabulary) — RRF has little
-independent signal left to add on top. A real embedding model, which
-captures paraphrase and synonymy the keyword branch can't see at all,
-would be expected to show a larger hybrid-over-vector-only gap; this
-harness is what would show that gap once a real `AI_EMBEDDING_PROVIDER`
-is configured, not just claim it. Small chunks scoring worst (hit@1 78%,
+**Correction, added after re-validating this phase (see the head of this
+entry's follow-up validation pass below): the paragraph originally here
+claimed vector-only matched hybrid because "the mock embedder is a
+bag-of-words hasher, so semantic similarity and keyword overlap are
+highly correlated." That's true as far as it goes, but it isn't the real
+reason, and stating it without checking was a mistake — the actual reason
+is that the keyword branch barely ever activates at all for this golden
+set, for a structural reason unrelated to the embedder.** Instrumenting
+`match_document_chunks`'s own `text_rank` column against all 18 golden
+queries (a separate, targeted probe — see the validation write-up below)
+showed the keyword branch (`keyword_raw`, gated on `c.fts @@
+websearch_to_tsquery('english', query_text)`) returned a nonzero
+`text_rank` for only 2 of the 18 queries. `websearch_to_tsquery` ANDs
+every non-trivial word in the input together by default — confirmed
+directly (`select websearch_to_tsquery('english', 'How does HNSW
+indexing work here?')` → `'hnsw' & 'index' & 'work'`) — so a natural,
+conversationally-phrased question only matches a chunk that happens to
+contain (after stemming) every one of its content words, which is rare.
+A bare keyword-style query (just `HNSW`) does trigger it, and does
+correctly outrank an otherwise-irrelevant embedding when it does (also
+confirmed directly, with a decoy query embedding that shares no
+vocabulary with either candidate document). So the RPC's keyword branch
+is wired correctly and the harness reports it correctly — vector-only
+and hybrid scoring identically on this golden set is mostly because the
+keyword branch is nearly inert for phrased questions under
+`websearch_to_tsquery`'s AND semantics, not because the two branches are
+redundant. This is a real characteristic of the shipped Phase 1/5
+retrieval design, not a Phase 8 bug — surfaced here because building a
+harness that actually measures the real RPC is exactly what makes a
+finding like this possible instead of assumed. Whether to address it (e.g.
+extracting salient terms into an OR'd query, or using a different
+`to_tsquery` construction) is a retrieval-design decision, not made here.
+
+A real embedding model, which captures paraphrase and synonymy the
+keyword branch can't see at all, would still be expected to show hybrid
+outperforming vector-only more than this mock run does — the RRF fusion
+itself isn't in question, only how rarely its keyword input is populated
+for this specific golden set's phrasing style. Small chunks scoring worst (hit@1 78%,
 MRR 0.87) matches the intuition in the Chunking Strategy document itself
 — a tighter token budget can split a concept's explanation across more
 chunk boundaries, diluting any single chunk's own similarity to a broader
@@ -2407,3 +2444,65 @@ Full pipeline (lint/typecheck/test/build) green after these changes.
 `setup.mjs` and `seed.mjs` were already outside every workspace's ESLint
 config before this phase, and this file follows the same existing
 pattern rather than introducing an inconsistency.
+
+### D8.2 — Re-validating D8.1: the harness itself checks out; one of its own explanations didn't
+
+Asked directly whether Phase 8 was really done without gaps or bugs, on
+the same "prove it, don't just say so" standard as Phase 6. Two things
+came out of it.
+
+**Confirmed correct by direct re-reading of `scripts/eval-retrieval.mjs`:**
+the `dollarTag()`/`dq()` escaping is sound (a random 12-hex-char dollar-quote
+tag per script, immune to injection from any of the golden corpus's actual
+text); `content_hash` is computed identically to
+`documents.service.ts`'s `computeContentHash` (SHA-256 of title + `\0` +
+content); the chunk embedding input exactly mirrors
+`indexing.service.ts`'s real `${headingPath}\n\n${content}` construction;
+`match_document_chunks`'s positional argument order matches the RPC's
+real signature; every ephemeral database is dropped in a `finally` block
+whether its config's run succeeded or threw. Also checked whether the
+golden set's single-turn questions bypass `RetrievalService`'s query
+rewrite step the same way production does: they do —
+`maybeRewriteQuery` only runs `params.history.length > 0`, and every
+golden query is a standalone first-turn question, so the harness's
+"embed the raw question" behavior matches production exactly for the
+scenario it actually tests. Multi-turn follow-up query rewriting is
+consequently NOT exercised by this harness at all — a genuine, deliberate
+scope limitation, not a bug, and worth stating plainly rather than
+implying the harness covers more than it does.
+
+**Found and fixed: D8.1's own explanation for why vector-only scored
+identically to hybrid was incomplete to the point of being misleading.**
+It attributed the tie to the mock embedder's bag-of-words nature. Checked
+that claim directly instead of trusting it: instrumented all 18 golden
+queries against `match_document_chunks`'s own `text_rank` column and
+found the keyword branch produced a nonzero rank for only 2 of them.
+Root cause, confirmed live: `websearch_to_tsquery` ANDs every non-trivial
+word in a query by default (`websearch_to_tsquery('english', 'How does
+HNSW indexing work here?')` → `'hnsw' & 'index' & 'work'`), so a
+naturally-phrased question only matches a chunk containing every one of
+its stemmed content words — rare in practice. A bare keyword-style query
+(`HNSW` alone) does trigger the branch, and does correctly out-rank an
+otherwise-irrelevant embedding when it fires (checked with a decoy query
+embedding sharing no vocabulary with either candidate document) — so the
+RPC's keyword branch and this harness's use of it are both wired
+correctly; the D8.1 explanation of the *result* was just wrong. Corrected
+in place in D8.1 above rather than left standing next to a correction
+here, since a reader of D8.1 shouldn't have to cross-reference this entry
+to get the accurate version.
+
+This is a genuine, pre-existing characteristic of the Phase 1/5 hybrid
+retrieval design (the keyword half is largely inert for conversational
+phrasing, not just for this golden set), surfaced only because the
+harness measures the real RPC instead of a simulated one. It is not
+treated as a Phase 8 bug and not fixed here — changing how the keyword
+query is constructed (e.g. extracting salient terms and OR-ing them) is a
+retrieval-behavior change to already-shipped, pgTAP-tested code, and is
+flagged here as a candidate follow-up decision rather than made
+unilaterally.
+
+No Phase 8 code changes were needed beyond the docs correction above; the
+harness's mechanics were verified sound. Full pipeline
+(lint/typecheck/test/build) re-confirmed green after the docs edit; every
+throwaway probe database this validation pass created was dropped before
+finishing, and the one-off probe scripts used for it were not committed.
