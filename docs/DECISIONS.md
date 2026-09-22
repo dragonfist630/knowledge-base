@@ -1996,3 +1996,58 @@ now boots the app the way a person actually does — `pnpm dev`, reading the
 root `.env` off disk — and asserts a page renders, closing the gap noted in
 D6.11: Gate 6 passes `NEXT_PUBLIC_*` to its spawned `next dev` directly, so it
 never exercised root-`.env` loading and never could have caught D6.11/12/13.
+
+### D6.14 — Full-application audit: an auth bypass in the local HS256 fallback, and an open redirect in the login action
+
+Found by a deliberate, from-scratch security review of the whole app (not
+triggered by any observed failure), covering auth/RLS, chat streaming,
+documents/indexing/retrieval, and docs/onboarding truthfulness. Two of the
+findings were exploitable and are fixed here; the rest are tracked as
+separate follow-up work (retrieval staleness, chat/documents UX, docs).
+
+**Auth bypass.** `auth.guard.ts`'s `verify()` tries Supabase's `getClaims()`
+first and, only if that throws, falls back to a hand-rolled HS256
+verification against `SUPABASE_JWT_SECRET` (D3.1/D3.6 documents why this
+fallback exists at all: this sandbox has no Docker, so a bare `supabase
+start` signs with a fixed shared secret and there is no JWKS endpoint for
+`getClaims()` to call). The problem is that fallback had no `NODE_ENV` gate,
+and `.env.example` ships `SUPABASE_JWT_SECRET` as the exact publicly
+documented value `supabase start` always uses — a value `pnpm run setup`'s
+`setEnvIfEmpty` never overwrites. Anyone who read `.env.example` (i.e.
+anyone) could sign their own JWT with that constant, set `role:
+"authenticated"` and any `sub`, and — on any deployment where `getClaims()`
+ever fails or is unreachable — authenticate as that user id. On a
+self-hosted stack sharing the same secret, PostgREST then evaluates RLS as
+the victim: full account takeover with no credentials.
+
+Verified live, not just read: built `apps/api`, forged a token with `jose`
+using the public secret, pointed the API at an unreachable Supabase URL (so
+`getClaims()` is guaranteed to throw) and hit a real protected route with
+the forged token. Before the fix it authenticated successfully (reached the
+handler; failed downstream with a 500 from the unreachable DB, not a 401).
+
+Fixed by gating the fallback on `this.env.NODE_ENV !== "production"`. In a
+real production deployment the project uses asymmetric keys, so `getClaims()`
+is the only path that should ever succeed there; local dev and both e2e
+harnesses run non-production and are unaffected. Verified non-vacuously: with
+`NODE_ENV=production` the forged token now gets 401; with `NODE_ENV` unset it
+still reaches past auth exactly as before (matching local/e2e expectations).
+Then, to prove the test itself would have caught the original bug, the gate
+was temporarily removed and the build rerun — the forged token was accepted
+under `NODE_ENV=production` (500, not 401) — before restoring the fix.
+
+**Open redirect.** `apps/web/src/app/(auth)/actions.ts`'s `login` action
+redirects to a caller-supplied `redirectTo` after a guard of
+`redirectTo.startsWith("/")`. That check admits `//evil.example` and
+`/\evil.example` — both start with `/` but browsers resolve them as
+protocol-relative URLs to another origin — turning a normal post-login
+redirect into a credible phishing vector right after a real, successful
+sign-in.
+
+Fixed with a dedicated `isSafeRedirect()` helper requiring a single leading
+slash followed by a non-slash, non-backslash character
+(`/^\/(?![/\\])/`). Verified against 8 cases (ordinary paths with and
+without a query string, `//evil.example`, `/\evil.example`, an absolute
+`https://` URL, a schemeless bare host, and `null`) and confirmed
+non-vacuously that the old `startsWith("/")` check would have wrongly
+accepted both malicious cases the new check rejects.

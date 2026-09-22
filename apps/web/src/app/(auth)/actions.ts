@@ -21,7 +21,21 @@ export async function login(_prevState: AuthFormState, formData: FormData): Prom
   }
 
   const redirectTo = formData.get("redirectTo");
-  redirect(typeof redirectTo === "string" && redirectTo.startsWith("/") ? redirectTo : "/documents");
+  redirect(isSafeRedirect(redirectTo) ? redirectTo : "/documents");
+}
+
+/**
+ * A `redirectTo` is only safe if it is a path on THIS site. A bare
+ * `startsWith("/")` check is not enough: `//evil.example` and `/\evil.example`
+ * both start with "/" yet the browser treats them as protocol-relative URLs
+ * to another origin, turning a post-login redirect into an open redirect
+ * (credible credential-phishing right after a real sign-in). Require a
+ * single leading slash followed by a non-slash, non-backslash character —
+ * so "/documents" and "/documents/abc" pass while "//evil", "/\evil", and
+ * absolute "https://evil" do not.
+ */
+function isSafeRedirect(value: FormDataEntryValue | null): value is string {
+  return typeof value === "string" && /^\/(?![/\\])/.test(value);
 }
 
 export async function signup(_prevState: AuthFormState, formData: FormData): Promise<AuthFormState> {

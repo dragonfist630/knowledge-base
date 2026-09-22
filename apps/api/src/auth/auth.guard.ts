@@ -94,8 +94,26 @@ export class AuthGuard implements CanActivate {
       // fall through to the local HS256 fallback below
     }
 
-    const fallback = await this.verifyViaLocalSecret(token);
-    if (fallback) return fallback;
+    // The HS256 fallback is a LOCAL-DEVELOPMENT and TEST convenience only,
+    // and must never run in production. It trusts SUPABASE_JWT_SECRET as a
+    // symmetric signing key — but a bare `supabase start` uses a fixed,
+    // publicly documented secret, and this repo ships that exact value in
+    // .env.example (which `pnpm run setup` copies verbatim and never
+    // rewrites). If the fallback ran in production, anyone could mint a
+    // token for any user id with that public constant and be authenticated
+    // as them (on a local/self-hosted stack sharing the secret, PostgREST
+    // would then evaluate RLS as the victim — full account takeover). In a
+    // real production deployment the project uses asymmetric keys, so
+    // getClaims() above is the only path that should ever succeed; there is
+    // no legitimate reason to fall back to a shared secret there. Gating on
+    // NODE_ENV keeps local dev and both e2e harnesses (which run
+    // non-production and rely on the shared secret) working, while closing
+    // the bypass for anything deployed with NODE_ENV=production. See
+    // docs/DECISIONS.md Phase 6, D6.14.
+    if (this.env.NODE_ENV !== "production") {
+      const fallback = await this.verifyViaLocalSecret(token);
+      if (fallback) return fallback;
+    }
 
     throw new UnauthorizedException("Invalid or expired token.");
   }
