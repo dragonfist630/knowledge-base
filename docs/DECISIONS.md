@@ -2051,3 +2051,70 @@ without a query string, `//evil.example`, `/\evil.example`, an absolute
 `https://` URL, a schemeless bare host, and `null`) and confirmed
 non-vacuously that the old `startsWith("/")` check would have wrongly
 accepted both malicious cases the new check rejects.
+
+### D6.15 — `match_document_chunks` could return chunks from a version of a document that no longer exists
+
+Found by the same audit. `documents.content_hash` is updated to the NEW
+hash the instant an edit is saved (`documents.service.ts`'s `update()`),
+*before* the background indexing job that produces matching chunks has even
+started. Until that job's `replace_document_chunks` call succeeds — which
+can be seconds away, or never, if the embedding call fails and the document
+is left in `index_status = 'failed'` — `document_chunks` still holds
+whatever the *previous* version of the document produced, with nothing
+recording that they no longer correspond to `documents.content`.
+`match_document_chunks` had no way to tell the difference, so it kept
+serving those chunks as if they were current. That's not just stale text:
+`retrieval.service.ts`'s `packContext`, when merging overlap-adjacent
+chunks into one source block, re-slices the merged span out of the
+document's *current* `content` using `char_start`/`char_end` offsets that
+are only valid against the content the chunk was actually produced from —
+so a stale chunk could come back as a corrupted, mid-word splice of
+unrelated current text, silently presented as a verbatim quote.
+
+Fixed by giving `document_chunks` a `content_hash` column
+(`20260922182426_chunk-freshness-and-keyword-floor.sql`), stamped by
+`replace_document_chunks` with the same `p_content_hash` it already uses to
+guard the write itself, and adding `sr.content_hash = d.content_hash` /
+`kr.content_hash = d.content_hash` to `match_document_chunks`'s
+`semantic`/`keyword` CTEs — the same place `filter_tags` is already applied
+(after the ANN/GIN top-K fetch, per this file's existing planner note:
+joining `documents` any earlier defeats the HNSW index). A chunk is now
+retrievable only while it reflects the document's current content; the
+moment an edit lands, its old chunks stop being served until a successful
+reindex replaces them — a document with no successfully-indexed chunks
+yields no retrieval results for it rather than wrong ones, which is the
+correct failure mode for a RAG system.
+
+Verified live against a real Postgres 16 + pgvector 0.6.0 instance, not
+just read: inserted a document with a stale chunk (chunk `content_hash`
+`'hash-old'`, document `content_hash` `'hash-new'`) alongside a normal
+up-to-date document/chunk pair, and confirmed the RPC returns 0 rows for
+the stale one and 1 for the fresh one. Proven non-vacuous by recreating the
+exact pre-fix 6-argument function inline and rerunning the same scenario
+against it — it returned the stale chunk (1 row). `supabase/tests/match_document_chunks.test.sql`
+gained two pgTAP cases covering the same exclude/restore behavior
+(`pnpm db:test`); confirmed non-vacuous by running the suite against a
+database with only the prior migration applied, where it fails outright
+(`column "content_hash" ... does not exist`) rather than passing
+vacuously. `packages/shared/src/database.types.ts` gained the new column.
+
+A second issue was investigated alongside this one and deliberately left
+unchanged: the `fused` CTE's `where coalesce(sem.similarity, 0) >=
+min_similarity or kw.id is not null` lets any keyword-search hit bypass the
+semantic `min_similarity` floor entirely, which reads on its face like it
+could let a near-zero-relevance keyword match slip into context. Tested
+live against `ts_rank_cd` with its actual default weighting (no
+`setweight()` calls anywhere in this schema, so every lexeme is weight
+`'D'`): a single real term match scores `~0.1` regardless of how much
+surrounding filler text there is, because `ts_rank_cd` isn't normalizing by
+document length here — there is no continuous "weak but nonzero" band to
+put a meaningful floor on. A `min_text_rank` threshold either does nothing
+(set low enough to allow real single-term matches through) or starts
+rejecting genuine single-keyword hits (set higher), and rejecting a literal
+term match a user typed is not obviously more correct than the current
+"any real keyword hit counts" behavior — it's standard hybrid-search
+practice to let an exact term match bypass a semantic-similarity floor that
+exists specifically because embedding similarity is noisy at low values.
+Recorded here rather than silently dropped so this doesn't get re-flagged
+without this context: it was investigated, tested against live data, and
+not found to be a real defect.

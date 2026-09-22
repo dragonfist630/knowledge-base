@@ -23,12 +23,12 @@ values ('00000000-0000-0000-0000-0000000000d1', 'A''s doc', 'hello world', 'hash
 
 insert into public.document_chunks (
   id, document_id, chunk_index, content, token_count, char_start, char_end,
-  embedding, embedding_model
+  embedding, embedding_model, content_hash
 ) values (
   '00000000-0000-0000-0000-0000000000c1',
   '00000000-0000-0000-0000-0000000000d1',
   0, 'hello world', 2, 0, 11,
-  array_fill(0.01, array[1536])::extensions.vector, 'test-model'
+  array_fill(0.01, array[1536])::extensions.vector, 'test-model', 'hash-a'
 );
 
 insert into public.conversations (id, title)
@@ -59,10 +59,10 @@ select is(
 select throws_ok(
   $t$insert into public.document_chunks (
       document_id, chunk_index, content, token_count, char_start, char_end,
-      embedding, embedding_model
+      embedding, embedding_model, content_hash
     ) values (
       '00000000-0000-0000-0000-0000000000d1', 1, 'sneaky', 1, 0, 5,
-      array_fill(0.01, array[1536])::extensions.vector, 'test-model'
+      array_fill(0.01, array[1536])::extensions.vector, 'test-model', 'hash-a'
     )$t$,
   '42501',
   null,

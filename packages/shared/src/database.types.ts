@@ -102,6 +102,7 @@ export type Database = {
           char_start: number
           chunk_index: number
           content: string
+          content_hash: string
           created_at: string
           document_id: string
           embedding: string
@@ -117,6 +118,7 @@ export type Database = {
           char_start: number
           chunk_index: number
           content: string
+          content_hash: string
           created_at?: string
           document_id: string
           embedding: string
@@ -132,6 +134,7 @@ export type Database = {
           char_start?: number
           chunk_index?: number
           content?: string
+          content_hash?: string
           created_at?: string
           document_id?: string
           embedding?: string
