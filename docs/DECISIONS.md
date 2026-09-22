@@ -2586,3 +2586,58 @@ documentation, sourced from a fresh, targeted re-read of the code rather
 than from this log's own earlier summaries of it (an ADR log describing a
 Phase 3 decision is not a substitute for reading Phase 3's actual code
 when Phase 9 needs to describe it precisely).
+
+### D9.2 — Re-validating D9.1: two independent adversarial fact-checks against the docs, 4 real corrections in `docs/API.md`
+
+Asked directly whether Phase 9 was done without gaps or bugs. Since Phase 9
+is pure documentation, "bugs" here means factual inaccuracies — checked by
+having two fresh reviewers, with no memory of writing the docs, read
+`docs/ARCHITECTURE.md`/`docs/API.md`/`docs/SCALING.md` side by side with
+the real source and try to find something wrong, rather than re-reading my
+own work and confirming it looked right.
+
+**`docs/ARCHITECTURE.md` and `docs/SCALING.md`: checked out with zero
+discrepancies.** Every diagram node/edge, both request-flow narratives, the
+auth-boundary claims (including the specific, easy-to-get-wrong ones: the
+HS256 fallback's `NODE_ENV !== "production"` gate, the no-service-role-key
+guard test), the background/async claims, and every specific number in
+`docs/SCALING.md` (queue concurrency, HNSW index params, the already-deferred
+`iterative_scan` optimization, AI timeout/retry defaults) were independently
+re-derived from the source and matched. The "no Dockerfile, no CI, no
+deploy config" claim was re-confirmed with a fresh `find` rather than
+trusted.
+
+**`docs/API.md`: 4 real problems found, all fixed.**
+
+1. **A materially wrong claim, not just an omission.** The rate-limiting
+   section said `POST /chat` and `POST /chat/stream` "share one counter"
+   under the `chat` bucket. Checked directly against
+   `@nestjs/throttler`'s actual `generateKey()` (not assumed): it hashes
+   `${ClassName}-${HandlerName}-${throttlerName}-${tracker}`, and
+   `UserThrottlerGuard` only overrides `getTracker` (who), never
+   `generateKey` (which bucket instance) — so the two routes get two
+   **independent** 20-per-60s counters keyed by their different handler
+   names, not one shared 20. A user could make 20 requests to each in the
+   same window before either 429s. This is the kind of claim that looks
+   authoritative and is wrong in a way nobody would notice without reading
+   the throttler package's own source — exactly why it needed independent
+   verification rather than trusting the original research pass.
+2. **A self-contradiction**, introduced by editing one paragraph without
+   checking a nearby one: `POST /chat`'s success response was correctly
+   documented as `201` (no `@HttpCode` set, Nest's `POST` default), but its
+   error-path description two paragraphs later called the same response a
+   "`200`-shaped response." Fixed to say `201` consistently.
+3. **A real documentation gap**: `resumeStuckIndexing` (the lazy
+   stuck-indexing recovery sweep) runs on **both** `list()` and `getById()`
+   in `documents.service.ts`, but the doc only mentioned it under
+   `GET /documents`, silently omitting it from `GET /documents/:id`. Added.
+4. **A precision error**: `GET /usage`'s `from` field was commented "ISO
+   date" but `usage.service.ts` actually returns a full ISO 8601
+   *datetime* (`toISOString()`, time component included) — a caller
+   comparing it against a bare date string would get a subtly wrong
+   result. Corrected.
+
+All four are now fixed in `docs/API.md`. No changes were needed in
+`docs/ARCHITECTURE.md` or `docs/SCALING.md`. Full pipeline
+(lint/typecheck/test/build) re-confirmed green after the corrections —
+docs-only, no application code touched by this validation pass either.

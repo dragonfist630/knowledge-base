@@ -18,10 +18,15 @@ verification mechanics.
 the two public routes): `default` — 120 requests / 60s
 (`THROTTLE_DEFAULT_LIMIT`/`THROTTLE_DEFAULT_TTL_MS`) — applies to every
 route unless noted otherwise; `chat` — 20 requests / 60s
-(`THROTTLE_CHAT_LIMIT`/`THROTTLE_CHAT_TTL_MS`) — applies only to
-`POST /chat` and `POST /chat/stream`, and the two routes share one counter.
-Exceeding a bucket returns `429`. Both are configurable via env vars; see
-`.env.example`. **Caveat**: rate-limit counters are in-memory per process
+(`THROTTLE_CHAT_LIMIT`/`THROTTLE_CHAT_TTL_MS`) — applies to both
+`POST /chat` and `POST /chat/stream`, but as **two separate 20/60s
+counters, not one shared one**: `@nestjs/throttler`'s default key includes
+the controller handler's method name, and `UserThrottlerGuard` only
+overrides the tracker (who — the user id), not the key generator (what
+bucket instance), so a user can make 20 requests to each route in the same
+window before either one 429s, not 20 combined. Exceeding a bucket returns
+`429`. Both limits are configurable via env vars; see `.env.example`.
+**Caveat**: rate-limit counters are in-memory per process
 (no shared store is configured) — see `docs/SCALING.md`.
 
 **Validation.** Every request body/query/param is validated against a Zod
@@ -108,14 +113,19 @@ or all `*` for a key ≤8 characters — the real key is never returned.
 
 **Errors**: `400` on an out-of-range query param. This call also lazily
 re-enqueues any of the caller's own documents found stuck in
-`pending`/`indexing` from a prior process restart — that sweep's own
-failures are swallowed and never surface here.
+`pending`/`indexing` from a prior process restart (the same
+`resumeStuckIndexing` sweep described under `GET /documents/:id` below) —
+that sweep's own failures are swallowed and never surface here.
 
 ### `GET /documents/:id`
 
 **Response `200`**: `DocumentSummary & { content: string }`.
 
 **Errors**: `400` invalid uuid; `404` not found or not visible under RLS.
+
+Runs the same lazy stuck-indexing recovery sweep as `GET /documents`
+(scoped to the caller's own documents, failures swallowed) — not just the
+list endpoint.
 
 ### `POST /documents`
 
@@ -174,7 +184,7 @@ A client disconnect aborts the underlying LLM call; a client-initiated stop is *
 
 ### `POST /chat`
 
-The non-streaming equivalent — same `ChatService` orchestration, collected into one JSON response instead of SSE. Same body shape and rate-limit bucket as `/chat/stream` (they share one counter).
+The non-streaming equivalent — same `ChatService` orchestration, collected into one JSON response instead of SSE. Same body shape and `chat` rate-limit bucket as `/chat/stream`, but its own independent 20/60s counter (see the rate-limiting note above) — not combined with `/chat/stream`'s.
 
 **Response `201`** (no explicit status code is set, so this is Nest's default for `POST`):
 
@@ -193,7 +203,7 @@ The non-streaming equivalent — same `ChatService` orchestration, collected int
 
 `RetrievalDebug`: `{ rewrittenQuery: string, usedRewrite: boolean, sourceCount: number }`
 
-**Errors**: `400` body validation; `404` unknown/inaccessible `conversationId` — this **does** surface as a real HTTP 404 here, unlike the streaming route, because nothing has been written to the response yet when it's thrown. A retrieval or LLM failure *after* the conversation resolves does **not** throw — it comes back as a normal `200`-shaped response with `assistantMessage.status: "error"` (or `"aborted"`).
+**Errors**: `400` body validation; `404` unknown/inaccessible `conversationId` — this **does** surface as a real HTTP 404 here, unlike the streaming route, because nothing has been written to the response yet when it's thrown. A retrieval or LLM failure *after* the conversation resolves does **not** throw — it still comes back as the normal `201` response shown above, just with `assistantMessage.status: "error"` (or `"aborted"`) inside an otherwise-successful body.
 
 ### `GET /conversations`
 
@@ -233,7 +243,7 @@ The non-streaming equivalent — same `ChatService` orchestration, collected int
 
 ```ts
 {
-  from: string,       // ISO date, today - days
+  from: string,       // full ISO 8601 datetime (toISOString()), not just a date — (today - days)
   days: number,
   totals: { promptTokens: number, completionTokens: number, totalTokens: number, eventCount: number },
   rows: { day: string, operation: "chat" | "embedding" | "query_rewrite", model: string, promptTokens: number, completionTokens: number, totalTokens: number, eventCount: number }[]
