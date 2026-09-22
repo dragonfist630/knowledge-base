@@ -2506,3 +2506,83 @@ harness's mechanics were verified sound. Full pipeline
 (lint/typecheck/test/build) re-confirmed green after the docs edit; every
 throwaway probe database this validation pass created was dropped before
 finishing, and the one-off probe scripts used for it were not committed.
+
+## Phase 9
+
+### D9.1 — Architecture diagram, full API reference, and scaling notes, all sourced from the code rather than written ahead of it
+
+The three remaining Phase 0 promises (an architecture diagram, a full API
+reference, scaling notes — the fourth, Loom walkthroughs, is out of scope
+for this assistant and stays unwritten). Rather than writing these from
+memory of what was built, two research passes read every controller,
+service, DTO, guard, RPC, and the actual module import graph first
+(`apps/api/src/app.module.ts`, all 5 `*.controller.ts` files, both
+migrations, `IndexingQueue` in full), and `docs/ARCHITECTURE.md`/
+`docs/API.md`/`docs/SCALING.md` were written from those findings — every
+non-obvious claim in all three documents traces to a specific file, not a
+plausible-sounding description of how a RAG app like this "would" work.
+
+**`docs/ARCHITECTURE.md`**: a Mermaid system diagram plus the two main
+request flows written out end to end (document save → indexing,
+chat question → streaming answer), the auth boundary (JWT verification
+path, why the local HS256 fallback is architecturally unreachable in
+production, why there's no service-role client anywhere), background/async
+work (the in-process indexing queue, the lazy per-request stuck-job
+recovery sweep — confirmed there is genuinely no boot-time sweep, and why
+not: RLS means there's no user context to run one as at startup), and a
+plainly-stated "what's not built yet" section (no Dockerfile, no CI, no
+deploy config of any kind — confirmed by `find`, not assumed). The diagram
+itself was rendered locally with `mermaid-cli` against the sandbox's
+pre-installed Chromium before being committed, specifically to catch a
+syntax error before it reached a document a developer would read raw
+without ever seeing it rendered — non-vacuous in the same spirit as this
+project's regression-test discipline, just applied to a diagram instead of
+a test.
+
+**`docs/API.md`**: every one of the 15 real HTTP endpoints across the 5
+controllers that exist (confirmed the count directly — there is no
+indexing or retrieval controller; both are internal-only services), each
+with its exact request/response shape read from the real Zod schema (not
+paraphrased), every distinct error case traced through the actual service
+layer to its real HTTP status, and the global conventions (the single
+error-response shape every route shares, why there's no Nest
+`ValidationPipe` — validation is 100% explicit per route via a shared
+`ZodValidationPipe`, how `POST /chat/stream`'s SSE contract differs from
+ordinary error handling — most in-turn failures arrive as an `error` event
+inside a `200` stream, not an HTTP error status, with the one documented
+exception being an unknown `conversationId`, which fails before the SSE
+headers commit). Caught and corrected one easy-to-assume-wrong detail
+before it shipped: neither `POST /chat` nor `POST /documents/:id/reindex`
+has an explicit `@HttpCode` decorator, so both return Nest's **default**
+`201`, not `200` — confirmed by reading the controller source directly
+rather than assuming a POST that "does an action" returns 200.
+
+**`docs/SCALING.md`**: ranked by which limit you'd hit first, not
+alphabetically or by category. The headline finding, already implied by
+Phase 8's own research but stated explicitly here for the first time: the
+in-memory `IndexingQueue` (`p-queue`, concurrency 2, no persistence, no
+external broker) is the single structural ceiling on this app's ability to
+scale `apps/api` horizontally at all — running more than one `apps/api`
+replica today would mean two independent queues, each capable of
+double-processing the same document's indexing job, and a process restart
+silently drops every job still queued (mitigated only by the lazy
+per-request recovery sweep `docs/ARCHITECTURE.md` already documents, which
+has its own gap: an abandoned document stays stuck indefinitely). Also
+flagged, and confirmed by checking the actual `ThrottlerModule` config
+rather than assuming: rate-limit counters are in-memory per process with
+no shared storage backend configured, so running multiple `apps/api`
+instances would silently multiply the effective rate limit by instance
+count rather than erroring — a real, sourced finding, not a generic
+"consider Redis" suggestion. The `match_document_chunks` migration was
+also found to already contain its own deliberately-deferred optimization
+note (pgvector's HNSW iterative scan, left disabled pending a version
+check) — surfaced in `docs/SCALING.md` rather than restated as if it were
+a new finding, since the original author already made and documented that
+call.
+
+Full pipeline (lint/typecheck/test/build) green after these three files
+and the README updates. No application code changed in this phase — pure
+documentation, sourced from a fresh, targeted re-read of the code rather
+than from this log's own earlier summaries of it (an ADR log describing a
+Phase 3 decision is not a substitute for reading Phase 3's actual code
+when Phase 9 needs to describe it precisely).

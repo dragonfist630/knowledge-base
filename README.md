@@ -2,19 +2,22 @@
 
 AI-Powered Knowledge Base — a Goodspeed Studio technical assessment build.
 
-> **Status: Phase 8 (retrieval-quality eval harness).** The core app is
-> built and working end to end: sign up/sign in, create and edit Markdown
-> documents, ask questions about them in a streaming chat with inline
-> citations, and track AI usage/cost. Phase 6 was a from-scratch audit of
-> the whole thing — security, retrieval correctness, chat/editor UX, and
-> these docs — with every fix verified live (forged tokens, a real
-> Postgres + pgvector instance, non-vacuous regression tests), not just
-> read. Phase 8 adds `pnpm eval`, a real-stack retrieval-quality harness
-> (hit@1/hit@3/hit@8/MRR across chunking/hybrid configs). See
-> `docs/DECISIONS.md` for the full, dated log of every decision and fix,
-> including both phases'. An architecture diagram, a full API reference,
-> scaling notes, and the Loom walkthroughs are still Phase 9 deliverables,
-> not yet written.
+> **Status: Phase 9 (architecture, API reference, scaling notes).** The
+> core app is built and working end to end: sign up/sign in, create and
+> edit Markdown documents, ask questions about them in a streaming chat
+> with inline citations, and track AI usage/cost. Phase 6 was a
+> from-scratch audit of the whole thing — security, retrieval correctness,
+> chat/editor UX, and these docs — with every fix verified live (forged
+> tokens, a real Postgres + pgvector instance, non-vacuous regression
+> tests), not just read. Phase 8 added `pnpm eval`, a real-stack
+> retrieval-quality harness (hit@1/hit@3/hit@8/MRR across chunking/hybrid
+> configs). Phase 9 adds `docs/ARCHITECTURE.md` (a real diagram + request
+> flows, sourced from the actual code), `docs/API.md` (every route,
+> request/response shape, and error case), and `docs/SCALING.md` (an
+> honest bottleneck list, ranked by which one you'd hit first). See
+> `docs/DECISIONS.md` for the full, dated log of every decision and fix
+> across all phases. The Loom walkthroughs remain unwritten — video
+> recording isn't something this assistant can produce.
 
 ## What's here
 
@@ -121,6 +124,9 @@ scripts/eval-retrieval.mjs   retrieval-quality eval harness — real chunker, re
                              embedder, real Postgres RPCs; see `pnpm eval` below
 evals/golden.json      the harness's purpose-built golden Q&A corpus
 docs/DECISIONS.md      dated ADR-style log of every choice, bug, and fix and why
+docs/ARCHITECTURE.md   a real diagram + request flows + auth boundary, sourced from the code
+docs/API.md            every route apps/api exposes — request/response shapes, error cases
+docs/SCALING.md         an honest bottleneck list for this app as actually built, ranked by severity
 docs/PROVIDERS.md      the full AI provider swap guide (OpenAI, Groq, Together, …)
 docs/AI_WORKFLOW.md    a running log of what was asked of the AI each phase
 ```
@@ -190,6 +196,13 @@ running on your machine.
 - [`docs/DECISIONS.md`](docs/DECISIONS.md) — the full, dated log of every
   architectural choice, bug found, and fix made, phase by phase. This is
   the most complete and most current source of truth in this repo.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — a real system diagram,
+  the two main request flows end to end (save/index, chat/stream), the
+  auth boundary, and what's genuinely not built yet (no Dockerfile, no CI).
+- [`docs/API.md`](docs/API.md) — every route `apps/api` exposes: auth,
+  rate limits, exact request/response shapes, and every real error case.
+- [`docs/SCALING.md`](docs/SCALING.md) — an honest bottleneck list for
+  this app as actually implemented, ranked by which one you'd hit first.
 - [`docs/PROVIDERS.md`](docs/PROVIDERS.md) — the AI provider swap guide.
 - [`docs/AI_WORKFLOW.md`](docs/AI_WORKFLOW.md) — a narrative log of what
   was asked of the AI each phase and how mistakes got caught.
