@@ -8,6 +8,7 @@ import { MessageList } from "@/features/chat/components/message-list";
 import type { ChatScope } from "@/features/chat/components/scope-selector";
 import { useChatStream } from "@/features/chat/hooks/use-chat-stream";
 import { useConversation } from "@/features/chat/hooks/use-conversation";
+import { isAssistantMessageSettled } from "@/features/chat/stream-history.mjs";
 
 /**
  * Shared by /chat (no conversation yet) and /chat/[conversationId] — as
@@ -55,11 +56,17 @@ export function ChatView({ conversationId, initialScope }: { conversationId?: st
 
   // The streaming turn "retires" into plain history once the conversation
   // refetch (triggered from useChatStream's `finally`) actually contains
-  // the finished assistant message — not just on `phase === "done"` — so
-  // there's no flash of empty content while that refetch is in flight.
-  const historyHasAssistant = chatStream.state.assistantMessageId
-    ? (conversation?.messages.some((message) => message.id === chatStream.state.assistantMessageId) ?? false)
-    : false;
+  // the FINALIZED assistant message — not just any row with a matching id.
+  // The assistant row exists in the DB from the very start of the turn (an
+  // empty placeholder, status "streaming" — see
+  // conversations.repository.ts's insertAssistantPlaceholder), so a
+  // same-id match alone would also match that still-empty placeholder. A
+  // background refetch of this conversation while the turn is still in
+  // flight — a window focus event is all it takes, since useConversation
+  // has no custom staleTime — would then hide the live (and, for an error,
+  // the error+retry) turn and show nothing until the turn actually
+  // finishes. See docs/DECISIONS.md Phase 6, D6.16.
+  const historyHasAssistant = isAssistantMessageSettled(conversation?.messages ?? [], chatStream.state.assistantMessageId);
   const showStreamingTurn = chatStream.state.phase !== "idle" && !historyHasAssistant;
 
   return (

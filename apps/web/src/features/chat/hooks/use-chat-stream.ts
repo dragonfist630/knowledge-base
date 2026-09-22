@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useReducer, useRef } from "react";
+import { useCallback, useEffect, useReducer, useRef } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import type { ChatEvent, ChatFinishReason, ChatRequest, SourceSummary, TokenUsage } from "@kb/shared";
 
@@ -24,20 +24,33 @@ export interface ChatStreamState {
 }
 
 const IDLE_STATE: ChatStreamState = { phase: "idle", text: "", sources: [], citedSourceIds: [] };
+const SENDING_STATE: ChatStreamState = { ...IDLE_STATE, phase: "searching" };
 
-type Action = { type: "reset" } | { type: "event"; event: ChatEvent } | { type: "aborted" };
+type Action = { type: "sending" } | { type: "event"; event: ChatEvent } | { type: "aborted" };
 
 /**
  * "Streaming chat state lives in a single useChatStream hook with a
  * reducer over ChatEvents" — the state-management rule in
  * docs/DECISIONS.md Phase 6. Mirrors the SSE contract's own ordering
  * (start -> sources -> (delta|citation)* -> done|error): `phase` is
- * "searching" from `start` until the first `delta` arrives, which is
+ * "searching" from the moment `send` is called until the first `delta`
+ * arrives (an in-flight request's own `start` SSE event doesn't need to
+ * round-trip first — see the "sending" action below and D6.16), which is
  * exactly the window the brief wants a "Searching your documents…"
  * indicator for.
  */
 function reducer(state: ChatStreamState, action: Action): ChatStreamState {
-  if (action.type === "reset") return IDLE_STATE;
+  // "sending", not "reset": phase flips to "searching" the instant send()
+  // is called, synchronously, before any network round trip. Composer's
+  // submit() (and this hook's isStreaming) both gate on phase !== "idle" —
+  // if phase only changed once the server's `start` SSE event arrived, a
+  // second Enter/click during that round trip (which used to leave phase
+  // at "idle" the whole time) would fire a second, fully concurrent
+  // /chat/stream request: two streams racing into the same reducer, two
+  // user messages posted, the first request's AbortController silently
+  // leaked (overwritten in abortRef without ever being aborted). See
+  // docs/DECISIONS.md Phase 6, D6.16.
+  if (action.type === "sending") return SENDING_STATE;
   if (action.type === "aborted") return { ...state, phase: "done", finishReason: "aborted" };
 
   const { event } = action;
@@ -91,8 +104,21 @@ export function useChatStream(conversationId: string | undefined, onStarted?: (c
 
   const send = useCallback(
     async (input: SendChatInput) => {
+      // Reentrancy guard, not just a UX nicety: this must not rely on
+      // `state.phase` (and therefore a render) having caught up yet.
+      // `abortRef.current` is set synchronously below and cleared
+      // synchronously in `finally`, so it's true "is a send currently in
+      // flight" state, independent of React's render timing. Composer
+      // also disables its Send button once `isStreaming` flips, but that
+      // update only takes effect on the next render — a fast double
+      // Enter/click before that render commits would otherwise start a
+      // second, fully concurrent /chat/stream request and leak the first
+      // request's AbortController (overwritten below without ever being
+      // aborted). See docs/DECISIONS.md Phase 6, D6.16.
+      if (abortRef.current) return;
+
       lastInputRef.current = input;
-      dispatch({ type: "reset" });
+      dispatch({ type: "sending" });
 
       const controller = new AbortController();
       abortRef.current = controller;
@@ -122,6 +148,18 @@ export function useChatStream(conversationId: string | undefined, onStarted?: (c
 
   const stop = useCallback(() => {
     abortRef.current?.abort();
+  }, []);
+
+  // Without this, navigating away mid-stream (clicking "Documents" in the
+  // nav, say — a real App Router navigation, unlike the same-conversation
+  // history.replaceState adoption this hook's own doc comment explains)
+  // unmounts this hook instance but leaves its fetch running to completion
+  // in the background: wasted tokens on a request nothing will ever render,
+  // and a `finally` that still fires and invalidates conversationsKeys.all
+  // for a component no longer on screen. See docs/DECISIONS.md Phase 6,
+  // D6.16.
+  useEffect(() => {
+    return () => abortRef.current?.abort();
   }, []);
 
   const retry = useCallback(() => {

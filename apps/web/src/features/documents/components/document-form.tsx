@@ -27,6 +27,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { IndexStatusBadge } from "@/features/documents/components/index-status-badge";
 import { TagInput } from "@/features/documents/components/tag-input";
+import { mergeServerSnapshot } from "@/features/documents/draft-merge.mjs";
 import { useDeleteDocument } from "@/features/documents/hooks/use-delete-document";
 import { useReindexDocument } from "@/features/documents/hooks/use-reindex-document";
 import { useSaveDocument } from "@/features/documents/hooks/use-save-document";
@@ -143,8 +144,15 @@ export function DocumentForm({
     savingRef.current = true;
     try {
       const saved = await save.mutateAsync({ id: documentId, values: current });
-      setOriginal(snapshotOf(saved));
-      setDraft(snapshotOf(saved));
+      const savedSnapshot = snapshotOf(saved);
+      setOriginal(savedSnapshot);
+      // Not `setDraft(savedSnapshot)`: the request was in flight for a real
+      // round trip, and the user may have kept typing during it. Only a
+      // field that's still exactly what was sent adopts the server's value
+      // — anything the user changed since is kept, and stays correctly
+      // flagged dirty against the new `original` baseline above. See
+      // docs/DECISIONS.md Phase 6, D6.16.
+      setDraft((live) => mergeServerSnapshot(current, savedSnapshot, live));
       toast.success("Document saved.");
       if (!documentId) {
         router.replace(`/documents/${saved.id}`);
@@ -169,10 +177,21 @@ export function DocumentForm({
 
   async function handleRetry() {
     if (!documentId) return;
+    // Captured now, not read as `dirty` after the await below: `dirty` is
+    // a plain render-time value, and this closure would otherwise use
+    // whatever it was AT THE MOMENT handleRetry was called — stale by the
+    // time reindex.mutateAsync resolves. If the user started typing only
+    // after clicking Retry (dirty was false at call time, so the stale
+    // check would wrongly treat the field as untouched), the old
+    // `dirty ? prev.content : saved.content` silently overwrote that fresh
+    // edit with reindexing's own (correct, but older) content. See
+    // docs/DECISIONS.md Phase 6, D6.16.
+    const sent = draftRef.current;
     try {
       const saved = await reindex.mutateAsync(documentId);
-      setOriginal(snapshotOf(saved));
-      setDraft((prev) => ({ ...prev, content: dirty ? prev.content : saved.content }));
+      const savedSnapshot = snapshotOf(saved);
+      setOriginal(savedSnapshot);
+      setDraft((live) => mergeServerSnapshot(sent, savedSnapshot, live));
     } catch (error) {
       toast.error(error instanceof ApiError ? error.message : "Failed to retry indexing.");
     }

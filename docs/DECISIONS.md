@@ -2118,3 +2118,81 @@ exists specifically because embedding similarity is noisy at low values.
 Recorded here rather than silently dropped so this doesn't get re-flagged
 without this context: it was investigated, tested against live data, and
 not found to be a real defect.
+
+### D6.16 — Chat/documents UX: a live stream and its error+retry UI could vanish mid-turn, and two async handlers could silently discard a user's in-flight edit
+
+Four related bugs found by the same audit, all sharing one shape: state
+that only becomes correct once an async operation resolves was being
+treated as already-correct the moment that operation was merely started
+(or merely id-matched), racing against the user continuing to interact
+with the page in the meantime.
+
+**The live stream (and its error+retry UI) could disappear mid-turn.**
+`chat-view.tsx`'s `historyHasAssistant` decided whether to stop showing the
+live streaming turn by checking only whether the assistant message's id
+appeared in `conversation.messages` — but that id exists in the database
+from the very start of a turn, as an empty placeholder row
+(`status: "streaming"`; see `insertAssistantPlaceholder`), specifically so
+the id is known before any text exists. `useConversation` has no custom
+`staleTime`, so React Query refetches it on window focus by default — a
+user alt-tabbing away and back mid-answer was enough to pull that
+still-empty placeholder into `conversation.messages`, match by id, and
+hide the live turn (text, sources, and — if the stream then errored — the
+error message and Retry button) until the turn actually finished and a
+later refetch brought in the real content. Fixed by requiring
+`status !== "streaming"` as well as an id match
+(`stream-history.mjs`'s `isAssistantMessageSettled`), covered by 6 `node:test`
+cases including a non-vacuity check against the old id-only behavior.
+
+**A fast double Enter/click could start two concurrent chat turns.**
+`Composer`'s `submit()` and `useChatStream`'s exposed `isStreaming` both
+gate on `state.phase !== "idle"`, but `phase` only left `"idle"` once the
+server's `start` SSE event came back over the network — so a second
+Enter/click during that round trip (not merely a *theoretical* window;
+ordinary network latency) went through, firing a second, fully concurrent
+`/chat/stream` request and leaking the first request's `AbortController`
+(silently overwritten, never aborted). Fixed two ways: `send()` now gates
+reentrantly on `abortRef.current` itself — true "is a request in flight"
+state, independent of whether React has re-rendered yet — and the reducer
+gained a `"sending"` action that flips `phase` to `"searching"`
+synchronously when `send()` is called, rather than waiting on the `start`
+event (which also makes the "Searching your documents…" indicator appear
+instantly instead of lagging by a round trip).
+
+**Navigating away mid-stream left the request running.** `useChatStream`
+never aborted its in-flight fetch on unmount — clicking to another page
+mid-answer left the stream running to completion in the background for a
+component no longer on screen (and its `finally` still fired, invalidating
+query state nothing would read). Fixed with a `useEffect` cleanup that
+aborts on unmount.
+
+**Two document-editor handlers could silently discard a user's in-flight
+edit.** `handleSave` unconditionally replaced the live draft with the
+server's response — `setDraft(snapshotOf(saved))` — the instant the save
+resolved; any keystrokes typed during that round trip were silently
+overwritten back to what was sent. `handleRetry` had a related but
+distinct bug: it decided whether to keep the live `content` using a
+`dirty` boolean read from the async closure, which is a plain render-time
+value captured at call time — if the user started typing only *after*
+clicking Retry (so `dirty` was `false` when the closure captured it),
+reindexing's response (unrelated to the edit, but older) silently
+overwrote the fresh keystrokes once the request resolved, because the
+stale closure still believed nothing had changed. Both fixed with one
+shared helper, `draft-merge.mjs`'s `mergeServerSnapshot(sent, saved, live)`:
+a field adopts the server's value only if the *current* live draft still
+equals what was actually sent; otherwise the live (edited-during-the-request)
+value is kept, and correctly stays flagged dirty against the new baseline.
+Covered by 5 `node:test` cases including a non-vacuity check against the
+old unconditional-overwrite behavior.
+
+All four fixes are pure-logic-level and covered by `node --test`
+(`apps/web/package.json`'s `test` script now also discovers
+`src/**/*.test.mjs`, not just `scripts/*.test.mjs`) — full pipeline
+(lint/typecheck/test/build) green. The composer double-send guard and the
+abort-on-unmount fix are verified by code-level reasoning rather than an
+automated test: this repo has no component-testing harness (no
+vitest+jsdom+testing-library, no timing-control hook into Gate 6's
+Playwright suite) to deterministically simulate a race against a real
+render/network timeline, and adding one is a larger, separate piece of
+infrastructure work than this fix — noted here rather than silently
+claiming coverage that doesn't exist.
