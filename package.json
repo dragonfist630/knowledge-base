@@ -27,6 +27,8 @@
     "ai:check": "pnpm --filter api exec node dist/cli/ai-check.js"
   },
   "devDependencies": {
+    "@kb/ai": "workspace:*",
+    "@kb/rag-core": "workspace:*",
     "picocolors": "1.1.1",
     "supabase": "2.117.0",
     "turbo": "2.10.13",

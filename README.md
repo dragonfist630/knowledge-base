@@ -2,17 +2,19 @@
 
 AI-Powered Knowledge Base — a Goodspeed Studio technical assessment build.
 
-> **Status: Phase 6 (post-launch audit & hardening).** The core app is
+> **Status: Phase 8 (retrieval-quality eval harness).** The core app is
 > built and working end to end: sign up/sign in, create and edit Markdown
 > documents, ask questions about them in a streaming chat with inline
-> citations, and track AI usage/cost. Phase 6 is a from-scratch review of
+> citations, and track AI usage/cost. Phase 6 was a from-scratch audit of
 > the whole thing — security, retrieval correctness, chat/editor UX, and
 > these docs — with every fix verified live (forged tokens, a real
 > Postgres + pgvector instance, non-vacuous regression tests), not just
-> read. See `docs/DECISIONS.md` for the full, dated log of every decision
-> and fix, including this phase's. An architecture diagram, a full API
-> reference, scaling notes, and the Loom walkthroughs are still Phase 9
-> deliverables, not yet written.
+> read. Phase 8 adds `pnpm eval`, a real-stack retrieval-quality harness
+> (hit@1/hit@3/hit@8/MRR across chunking/hybrid configs). See
+> `docs/DECISIONS.md` for the full, dated log of every decision and fix,
+> including both phases'. An architecture diagram, a full API reference,
+> scaling notes, and the Loom walkthroughs are still Phase 9 deliverables,
+> not yet written.
 
 ## What's here
 
@@ -115,9 +117,9 @@ supabase/
   tests/                pgTAP tests for the RPCs and RLS isolation (`pnpm db:test`)
 scripts/setup.mjs      the one-command setup
 scripts/seed.mjs       creates the demo login + sample documents (needs apps/api running)
-scripts/eval-retrieval.mjs   retrieval-quality harness — NOT implemented yet, a
-                             deliberate Phase 8 placeholder; running it just prints
-                             that and exits (see `pnpm eval` below)
+scripts/eval-retrieval.mjs   retrieval-quality eval harness — real chunker, real
+                             embedder, real Postgres RPCs; see `pnpm eval` below
+evals/golden.json      the harness's purpose-built golden Q&A corpus
 docs/DECISIONS.md      dated ADR-style log of every choice, bug, and fix and why
 docs/PROVIDERS.md      the full AI provider swap guide (OpenAI, Groq, Together, …)
 docs/AI_WORKFLOW.md    a running log of what was asked of the AI each phase
@@ -139,8 +141,25 @@ pnpm db:test         # pgTAP tests in supabase/tests/ (needs local Supabase up)
 pnpm db:types        # regenerate packages/shared/src/database.types.ts from the local DB
 pnpm seed            # demo login + sample documents (needs `pnpm dev` running first)
 pnpm ai:check        # verify your AI_* config with one real chat + embedding call
-pnpm eval            # NOT implemented — prints a placeholder message; see above
+pnpm eval            # retrieval-quality eval — hit@1/hit@3/hit@8/MRR across configs
 ```
+
+### Retrieval-quality eval (`pnpm eval`)
+
+`scripts/eval-retrieval.mjs` runs `evals/golden.json` — a purpose-built,
+12-document, 18-question Q&A corpus, deliberately separate from `pnpm seed`'s
+3 thin demo documents — through the real retrieval stack: the real chunker
+(`chunkDocument` from `@kb/rag-core`), the real embedding model (`createAi()`
+from `@kb/ai`, so it uses whatever `AI_EMBEDDING_PROVIDER` is set to — the
+keyless `mock` default needs no API key and costs nothing to run), and the
+real `replace_document_chunks`/`match_document_chunks` Postgres RPCs against
+an ephemeral database it bootstraps and drops itself (no Docker, same
+Postgres-reachable-on-`127.0.0.1:5432` prerequisite as `pnpm test:e2e` —
+see above). It prints hit@1/hit@3/hit@8/MRR for 5 configs — hybrid vs.
+vector-only, three chunk-size presets, and with/without the heading
+breadcrumb in the embedding input — so a retrieval change's effect on
+quality is a number, not a guess. See `docs/DECISIONS.md` Phase 8, D8.1 for
+the full design writeup and a real run's output.
 
 ### Running the e2e suite (`pnpm test:e2e`)
 

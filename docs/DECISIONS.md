@@ -2262,3 +2262,148 @@ to the command instead of implying it does something.
 Full pipeline (lint/typecheck/test/build, 20/20 tasks) green after these
 changes; `pnpm ai:check` verified working immediately after a fresh
 `packages/* apps/api` build with no manual step in between.
+
+## Phase 8
+
+### D8.1 — `pnpm eval`: a real-stack retrieval-quality harness, replacing the Phase 0 "not implemented" placeholder
+
+`scripts/eval-retrieval.mjs` was a 9-line stub since Phase 0 (confirmed
+still true as of D6.17 above). Phase 8 replaces it with a harness that
+exercises the REAL retrieval stack end to end rather than reimplementing
+any chunking, embedding, or ranking math in JS: the real chunker
+(`chunkDocument` from `@kb/rag-core`), the real embedding model
+(`createAi()` from `@kb/ai`, so it honors whatever `AI_EMBEDDING_PROVIDER`
+is set to — the keyless `mock` default needs no API key and costs nothing
+to run), and the real `replace_document_chunks`/`match_document_chunks`
+Postgres RPCs, called via `psql` against an ephemeral database the harness
+bootstraps and drops itself. Reimplementing retrieval scoring in JS would
+mean the eval could pass while the real RPC it's supposedly evaluating had
+its own bug — exactly the kind of gap this whole audit phase has been
+about closing, not introducing.
+
+**Infrastructure reused, not rebuilt.** The ephemeral-database bootstrap
+(`apps/api/test/e2e/bootstrap.sql`'s auth shim + the real
+`supabase/migrations/*.sql`, applied unmodified) is the same pattern
+`apps/api/test/e2e/global-setup.ts` and `apps/web/e2e/global-setup.ts`
+already use — just without standing up PostgREST/HTTP in front of it,
+since this harness calls the RPCs directly. `@kb/ai` and `@kb/rag-core`
+were added to the root `package.json` as `workspace:*` devDependencies so
+a plain Node script at the repo root can import them (pnpm doesn't hoist
+an undeclared workspace package into the root's own `node_modules`).
+
+**The golden set is a new, purpose-built corpus** (`evals/golden.json`):
+12 documents (~200–350 words each, real prose about this app's own
+architecture — chunking, embeddings, hybrid retrieval/RRF, RLS/auth, rate
+limiting, citations, indexing status, tags/scoping, chat streaming,
+usage tracking, Markdown editing, and D6.15's content-hash freshness
+check) and 18 questions, each with one or two ground-truth relevant
+document titles. `scripts/seed.mjs`'s existing 3 demo documents were
+judged too thin a corpus for meaningful hit@K/MRR — too few documents for
+a wrong answer to even be possible. The 12 golden documents deliberately
+share vocabulary across several pairs (e.g. "Content Hash and Stale Chunk
+Prevention" and "Document Indexing Status" both talk about reindexing;
+several documents mention embeddings) specifically so ranking quality has
+room to actually vary between configs instead of being trivially 100% no
+matter what.
+
+**Auth context over a raw `psql` session.** Each config's corpus is
+written and queried as one seeded, RLS-scoped `authenticated` user, using
+the exact same `select set_config('request.jwt.claims', ..., <is_local>);
+set role authenticated;` pattern `supabase/tests/*.test.sql` already uses
+— not a new mechanism. Two bugs surfaced while getting this right, both
+caught by actually running the harness against a live database rather than
+trusting the SQL by inspection:
+
+1. The query-side script originally passed `is_local = true` to
+   `set_config`. Outside an explicit `begin`/`commit` block, every
+   top-level statement in a `psql -f` script runs in its own implicit
+   transaction — so a `true` (transaction-local) claim reset again before
+   the very next statement even ran, and every query failed with `invalid
+   input syntax for type json` (`auth.uid()`'s `current_setting(...)::json`
+   cast choking on the now-empty GUC). Fixed by using `is_local = false`
+   (session-level) instead, matching what the corpus-indexing script
+   already did correctly — the query-side script just hadn't followed its
+   own established pattern.
+2. `select set_config(...)` returns its own value as a row. Run inline
+   ahead of the real query in the same `-t -A` (tuples-only, unaligned)
+   `psql` invocation, that row printed ahead of the actual
+   `document_title` results and corrupted the parse — the harness would
+   have silently treated `{"sub":"...","role":"authenticated"}` as if it
+   were a returned document title. Fixed with `\gset`, which assigns a
+   query's result to a psql variable instead of printing it, so only the
+   real result rows reach stdout.
+
+**Config sweeps need no RPC signature changes.** "Vector-only" passes an
+empty `query_text` — confirmed live that `websearch_to_tsquery('english',
+'')` produces an empty tsquery and `fts @@ <empty tsquery>` is always
+false, so `keyword_raw` returns zero rows and the RPC's fused CTE falls
+back to semantic-only, with no code change needed. "Chunk size" sweeps
+just call `chunkDocument()` with different `targetTokens`/`maxTokens`/
+`overlapTokens`. "Breadcrumb" toggles whether each chunk's embedding
+input is `${headingPath}\n\n${content}` (indexing.service.ts's real
+construction) or `content` alone.
+
+**Deliberately no similarity floor.** Production defaults
+`RAG_MIN_SIMILARITY` to 0.25 to keep weak semantic-only matches out of a
+real chat answer — a product decision about what's worth showing a user.
+The harness instead passes `min_similarity = -1`, since flooring it here
+would hide exactly the ranking differences between configs this harness
+exists to surface (a config that ranks the right document 2nd instead of
+1st is still useful signal, even if that hit would've been floored out of
+a real answer).
+
+**Non-vacuity, proven rather than assumed.** Before trusting the harness's
+numbers, its embedding step was deliberately broken (every chunk and every
+query embedded from the same constant nonsense string instead of the real
+text) and re-run against the baseline config. Real text: hit@1 83%, MRR
+0.90. Broken/noise embeddings: hit@1 22%, MRR 0.33 — a sharp, expected
+collapse (not all the way to 0%, since `hybrid: true` leaves the keyword
+branch matching real document text even while embeddings are worthless —
+itself a small, honest demonstration of why this app's retrieval is
+hybrid rather than semantic-only, matching D8.1's own Hybrid Retrieval
+document in the golden set). This confirms the harness responds to actual
+retrieval quality rather than reporting a good-looking number regardless
+of input.
+
+**A real run against the keyless mock embedder** (`AI_EMBEDDING_PROVIDER`
+unset — the deterministic feature-hashed bag-of-words model from
+`packages/ai/src/mock/mock-embedding-model.ts`, so this reproduces with
+zero API cost and no key):
+
+```
+config                                          hit@1  hit@3  hit@8    mrr
+Baseline — hybrid, default chunking, breadcrumb    83%    94%   100%   0.90
+Vector-only — semantic search alone                83%    94%   100%   0.90
+Small chunks — ~150 target tokens                  78%    94%   100%   0.87
+Large chunks — ~900 target tokens                  83%    94%   100%   0.90
+No heading breadcrumb in embedding input           83%    94%    94%   0.88
+```
+
+Vector-only matching hybrid exactly on this corpus/config isn't
+surprising for the mock embedder specifically: it's a bag-of-words hasher,
+so semantic similarity and keyword overlap are highly correlated by
+construction (both ultimately measure shared vocabulary) — RRF has little
+independent signal left to add on top. A real embedding model, which
+captures paraphrase and synonymy the keyword branch can't see at all,
+would be expected to show a larger hybrid-over-vector-only gap; this
+harness is what would show that gap once a real `AI_EMBEDDING_PROVIDER`
+is configured, not just claim it. Small chunks scoring worst (hit@1 78%,
+MRR 0.87) matches the intuition in the Chunking Strategy document itself
+— a tighter token budget can split a concept's explanation across more
+chunk boundaries, diluting any single chunk's own similarity to a broader
+question about it. No-breadcrumb's hit@8 drop (100% → 94%) shows the
+heading path pulling its weight: without the document title/section
+context prefixed onto a chunk's embedding input, a chunk whose own text
+is generic in isolation loses the extra signal that context would have
+added.
+
+Every ephemeral database this harness creates (`kb_eval_<config-key>`) is
+dropped in a `finally` block regardless of success or failure, so a run
+never leaves a stray database behind on the shared local Postgres cluster
+Gate 3/Gate 6 also use.
+
+Full pipeline (lint/typecheck/test/build) green after these changes.
+`pnpm lint` doesn't cover `scripts/*.mjs` or `evals/*.json` — no new gap:
+`setup.mjs` and `seed.mjs` were already outside every workspace's ESLint
+config before this phase, and this file follows the same existing
+pattern rather than introducing an inconsistency.
