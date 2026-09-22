@@ -240,19 +240,41 @@ step("AI provider");
 
 step("Building packages");
 {
-  const build = run("pnpm", ["--filter", "./packages/*", "build"]);
-  if (build.status !== 0) fail("Building packages/* failed.", "Scroll up for the underlying error.");
-  ok("packages/* built");
+  // Also builds apps/api (turbo's build task depends on `^build`, so
+  // packages/* still build first) — not just packages/*. `pnpm ai:check`
+  // and `pnpm seed` both need apps/api/dist, and without this they used to
+  // fail with a confusing `Cannot find module '.../dist/cli/ai-check.js'`
+  // right after a supposedly-complete `pnpm setup`, since nothing before
+  // this ever built apps/api. apps/web is deliberately left out here — it
+  // takes noticeably longer and nothing setup.mjs itself still needs to run
+  // (seeding calls the API directly, not through Next) requires it; `pnpm
+  // dev`/`pnpm build` build it themselves. See docs/DECISIONS.md Phase 6,
+  // D6.17.
+  const build = run("pnpm", ["exec", "turbo", "build", "--filter=./packages/*", "--filter=api"]);
+  if (build.status !== 0) fail("Building packages/* and apps/api failed.", "Scroll up for the underlying error.");
+  ok("packages/* and apps/api built");
 }
 
-step("Seeding demo data");
-if (!supabaseUp) {
-  info("Local Supabase isn't running — skipping seed. Run `pnpm seed` once it's up.");
+// scripts/seed.mjs talks to apps/api over HTTP (POST /documents, etc. —
+// see its own docstring), and nothing before this point in setup ever
+// starts apps/api listening on a port; building it above only produces
+// dist/, it doesn't run it. Calling seed.mjs directly here always failed
+// with a connection error, silently swallowed by the warn() below —
+// `pnpm setup` never actually seeded anything, while unconditionally
+// printing "Demo login: demo@example.com / demo-password-123" at the end
+// as if it had. Fixed by not attempting it here at all — accurate
+// guidance below instead of a doomed attempt — rather than adding a
+// second background server (with its own port-conflict/orphaned-process
+// failure modes) into an already-long setup script; see
+// docs/DECISIONS.md Phase 6, D6.17, and check-dev-boot.mjs's own doc
+// comment for why this repo prefers an explicit, separate step over a
+// spawned dev server inside an automated one.
+step("Demo data");
+if (supabaseUp) {
+  info("Not seeded yet — that needs apps/api actually running, which `pnpm setup` doesn't start on its own.");
+  info("Run `pnpm dev`, then in a second terminal `pnpm seed`, to create it.");
 } else {
-  const seed = run("node", ["scripts/seed.mjs"]);
-  if (seed.status !== 0) {
-    warn("Seeding failed — the app still runs, just without demo data. See the error above.");
-  }
+  info("Skipped (local Supabase isn't running). Run `pnpm seed` once it's up.");
 }
 
 // ---------------------------------------------------------------------------
@@ -263,5 +285,11 @@ console.log(`  API health check: ${pc.underline("http://localhost:3001/health")}
 if (supabaseUp) {
   console.log(`  Supabase Studio:  ${pc.underline("http://localhost:54323")}`);
 }
-console.log(`  Demo login:       ${pc.dim("demo@example.com / demo-password-123")}`);
-console.log(`\n  Next: ${pc.bold("pnpm dev")}\n`);
+console.log(`\n  Next: ${pc.bold("pnpm dev")}`);
+if (supabaseUp) {
+  console.log(
+    `  Then: ${pc.bold("pnpm seed")} ${pc.dim(`(creates the demo login demo@example.com / demo-password-123 and sample documents)`)}\n`,
+  );
+} else {
+  console.log("");
+}

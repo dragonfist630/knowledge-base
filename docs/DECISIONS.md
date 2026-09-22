@@ -2196,3 +2196,69 @@ Playwright suite) to deterministically simulate a race against a real
 render/network timeline, and adding one is a larger, separate piece of
 infrastructure work than this fix — noted here rather than silently
 claiming coverage that doesn't exist.
+
+### D6.17 — Docs & onboarding: the README was frozen at "Phase 0", `pnpm setup` built the wrong things, and its own auto-seed step could never succeed
+
+Found by the same audit. Four separate problems, one theme: what setup
+and the README told a new clone to expect didn't match what actually
+happened.
+
+**`README.md` still said "Status: Phase 0 (scaffolding) only"** and "GET
+/health only so far" for `apps/api`, with no mention of documents, chat,
+auth, retrieval, or usage — all fully built since. Anyone reading it would
+believe they'd cloned an empty scaffold. Rewritten to describe what's
+actually here (documents, hybrid-RAG chat with citations, auth, usage),
+with an honest Phase 6 status line rather than reusing Phase 0's or
+prematurely claiming Phase 9's (the architecture diagram, full API
+reference, and Loom walkthroughs genuinely aren't written yet — the new
+README says so rather than implying otherwise).
+
+**`.env.example` pointed at a README section that didn't exist.**
+`scripts/setup.mjs` and `.env.example` both reference "Hosted Supabase" in
+the README, three times between them, as where to look when
+`SKIP_DOCKER=1` is set — the README had no such section. Added one, with
+the exact env vars to set (from `.env.example`'s own Supabase block) and
+why `SUPABASE_JWT_SECRET` is deliberately left blank for a hosted project
+(it's the local-only HS256 fallback D6.14 already documents and gates off
+in production).
+
+**`pnpm setup`'s "Building packages" step never built `apps/api`** — only
+`packages/*`. `pnpm ai:check` and `pnpm seed` both need
+`apps/api/dist/cli/ai-check.js` / a running `apps/api`, and nothing before
+either of them in a fresh clone's workflow ever built it. Reproduced
+directly: `mv apps/api/dist /tmp/backup && pnpm ai:check` fails with
+`Cannot find module '.../dist/cli/ai-check.js'`. Fixed by building
+`apps/api` in the same step (`turbo build --filter=./packages/* --filter=api`,
+which still builds `packages/*` first via `^build`); confirmed `pnpm
+ai:check` now runs immediately after with no separate manual build step.
+
+**`pnpm setup`'s own seed attempt could never have worked, and the
+"Demo login" message was printed unconditionally regardless.**
+`scripts/seed.mjs` talks to `apps/api` over HTTP (its own docstring says
+so), but nothing in `setup.mjs` ever starts `apps/api` — building it only
+produces `dist/`, it doesn't run it. `setup.mjs` called `node
+scripts/seed.mjs` directly anyway; every call failed with a connection
+error, caught by a `warn()` easy to miss, while the final banner still
+unconditionally printed `Demo login: demo@example.com / demo-password-123`
+as if it had succeeded. Reproduced directly: with nothing listening on
+port 3001, `node scripts/seed.mjs` (against a configured `.env`) fails
+trying to reach `apps/api`. Fixed by not attempting the doomed call at
+all — accurate guidance instead (`pnpm dev`, then `pnpm seed` in a second
+terminal), and the closing banner now only promises a demo login when
+that's actually the next step, not unconditionally. Deliberately not
+"fixed" by spawning a temporary `apps/api` inside `setup.mjs` to seed
+against: that trades one gap for a new failure surface (port conflicts,
+an orphaned process if setup is interrupted) inside an already-long
+script, the same reasoning `check-dev-boot.mjs`'s own doc comment gives
+for keeping that check a separate, explicit step rather than folding a
+spawned dev server into an automated one.
+
+Also confirmed, and documented rather than "fixed" as if it were new
+work: `pnpm eval` (`scripts/eval-retrieval.mjs`) is still a 9-line
+placeholder that prints "Not implemented yet" and exits — genuinely
+unimplemented, not a docs error. The README now says so explicitly next
+to the command instead of implying it does something.
+
+Full pipeline (lint/typecheck/test/build, 20/20 tasks) green after these
+changes; `pnpm ai:check` verified working immediately after a fresh
+`packages/* apps/api` build with no manual step in between.
