@@ -2883,3 +2883,13 @@ succeed while leaving the *actual* differently-named index behind,
 un-rebuilt for the new dimension. Both occurrences corrected to
 `document_chunks_embedding_hnsw`.
 
+### D9.9 — Final verification
+
+Full pipeline re-run clean after all of the above: `pnpm -w typecheck`,
+`pnpm -w lint`, and `pnpm -w test` (all packages/apps, 190+ unit tests)
+all green; `pnpm -w build` green; the full Gate 6 Playwright suite (both
+`smoke.spec.ts` tests, including the new conversation-switching one) green
+against a real Postgres/PostgREST/auth-gateway stack. No scratch/demo
+files were committed — the temporary debug instrumentation and e2e repro
+files used while investigating D9.6/D9.7 were removed before this pass
+was considered done.
