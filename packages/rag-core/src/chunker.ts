@@ -271,21 +271,178 @@ function splitRecursive(
   level = 0,
 ): Piece[] {
   if (text.trim().length === 0) return [];
-  if (countTokens(text) <= maxTokens || level >= SPLIT_SEPARATORS.length) {
+  if (countTokens(text) <= maxTokens) {
     return [{ text, start, end: start + text.length, atomic: false }];
   }
+  // `text` is now known to exceed maxTokens — hand off to a helper that
+  // doesn't re-check that on every level of separator escalation (see
+  // splitOversized's own comment: re-calling countTokens on the exact
+  // same, unchanged, possibly-huge `text` at each of the 4 separator
+  // levels was itself a real, measured cost for content with no natural
+  // separator at all).
+  return splitOversized(text, start, countTokens, maxTokens, level);
+}
+
+/**
+ * Splits `text`, ALREADY known to exceed `maxTokens`, by walking
+ * SPLIT_SEPARATORS from `level` onward. Deliberately does not re-call
+ * `countTokens(text)` on each escalation to a finer separator when no
+ * split was found — `text` hasn't changed, so it's already known to still
+ * exceed the budget, and re-checking it anyway (once per level, 4 times
+ * for content with no separator at all, e.g. CJK prose or a long unbroken
+ * base64/URL run) was a real, measured cost: gpt-tokenizer's BPE merge
+ * step is superlinear enough on long text that 4 redundant full-length
+ * calls were a meaningful fraction of total chunking time on such input.
+ * See docs/DECISIONS.md.
+ */
+function splitOversized(
+  text: string,
+  start: number,
+  countTokens: (text: string) => number,
+  maxTokens: number,
+  level: number,
+): Piece[] {
+  if (level >= SPLIT_SEPARATORS.length) {
+    // No natural separator (blank line, newline, sentence end, or even
+    // whitespace) could bring this piece under budget — e.g. CJK/Japanese
+    // prose (no ASCII inter-word spaces, sentence-final punctuation isn't
+    // `.`/`!`/`?`), or a long unbroken run like a base64 blob, URL, or
+    // hash. Falling back to just returning the oversized text here used
+    // to silently violate the documented hard cap (a single such chunk
+    // could be 10-100x over `maxTokens`) — see docs/DECISIONS.md for the
+    // real CJK-document/base64-blob repro this fixes. `hardSplit` below
+    // guarantees the cap by cutting on a raw token-count budget instead
+    // of a linguistic boundary, as a genuine last resort.
+    return hardSplit(text, start, countTokens, maxTokens);
+  }
   const sep = SPLIT_SEPARATORS[level];
-  if (!sep) return [{ text, start, end: start + text.length, atomic: false }];
+  if (!sep) return hardSplit(text, start, countTokens, maxTokens);
   const parts = splitPreservingOffsets(text, start, sep);
   if (parts.length <= 1) {
-    // Separator didn't actually split anything; try the next, finer one.
-    return splitRecursive(text, start, countTokens, maxTokens, level + 1);
+    // Separator didn't actually split anything; try the next, finer one —
+    // same `text`, already known oversized, no re-check needed.
+    return splitOversized(text, start, countTokens, maxTokens, level + 1);
   }
   return parts.flatMap((part) =>
     countTokens(part.text) > maxTokens
       ? splitRecursive(part.text, part.start, countTokens, maxTokens, level + 1)
       : [{ text: part.text, start: part.start, end: part.end, atomic: false }],
   );
+}
+
+/**
+ * A UTF-16 index that will become the START of a slice you're KEEPING
+ * (`text.slice(idx)`) must never land on the low half of a surrogate pair
+ * (0xDC00-0xDFFF) — the high half at `idx - 1` would be excluded, orphaning
+ * the low half and corrupting the text (and, once written to Postgres as
+ * UTF-8, silently becoming U+FFFD). Nudging forward one unit drops both
+ * halves from the kept slice, which can only shrink it — safe against any
+ * token budget already confirmed to fit at `idx`.
+ */
+function safeSuffixStart(text: string, idx: number): number {
+  if (idx > 0 && idx < text.length) {
+    const code = text.charCodeAt(idx);
+    if (code >= 0xdc00 && code <= 0xdfff) return idx + 1;
+  }
+  return idx;
+}
+
+/**
+ * A UTF-16 index that will become the END of a slice you're KEEPING
+ * (`text.slice(0, idx)`) must never land such that the kept prefix's last
+ * character is the high half of a surrogate pair with its low half (at
+ * `idx`) excluded. Nudging backward one unit drops the orphaned high half
+ * too, which can only shrink the kept slice — safe against any token
+ * budget already confirmed to fit at `idx`.
+ */
+function safePrefixEnd(text: string, idx: number): number {
+  if (idx > 0 && idx < text.length) {
+    const code = text.charCodeAt(idx);
+    if (code >= 0xdc00 && code <= 0xdfff) return idx - 1;
+  }
+  return idx;
+}
+
+/**
+ * Finds the largest prefix length of `text` (>= 1, forward progress
+ * guaranteed) whose token count fits `maxTokens`, without ever tokenizing
+ * the full (possibly huge) remaining text: an exponential ("galloping")
+ * search first finds a window that either exceeds the budget or reaches
+ * `text.length`, then a binary search narrows only that last doubling
+ * interval. A naive binary search over `[1, text.length]` instead calls
+ * `countTokens` on slices up to `text.length` on nearly every step, which
+ * made splitting one large oversized run (a big base64 blob, say) into
+ * many small pieces effectively O(n^2) — confirmed live: chunking a
+ * 20,000-character unbroken run took ~4s before this fix, vs. a few ms
+ * after. See docs/DECISIONS.md.
+ */
+// A ceiling on how large a window findHardSplitEnd will ever tokenize in
+// one call. Needed because gpt-tokenizer's BPE merge step is itself
+// superlinear on long runs of highly repetitive text (confirmed via
+// --prof: 100,000 identical-ish characters spent ~90% of wall time inside
+// bytePairMerge/ArrayPrototypeSplice, ~400ms for that one call alone) — an
+// unbounded exponential search would keep growing its window for exactly
+// this content (it compresses so well under BPE that 80 tokens can span
+// tens of thousands of characters) and multiply that per-call cost by
+// however many doublings it takes to overshoot. Capping the window means
+// worst case we return a smaller-than-optimal (but still perfectly valid
+// and still within maxTokens) cut for pathological input, in exchange for
+// bounded, predictable cost — realistic content (prose, code, base64, even
+// a 100,000-character synthetic blob with real entropy) never gets near
+// this cap in practice. See docs/DECISIONS.md.
+const HARD_SPLIT_WINDOW_CAP = 8000;
+
+function findHardSplitEnd(text: string, countTokens: (text: string) => number, maxTokens: number): number {
+  if (text.length <= 1 || countTokens(text.slice(0, 1)) > maxTokens) return 1;
+
+  const ceiling = Math.min(text.length, HARD_SPLIT_WINDOW_CAP);
+  let lo = 1;
+  let hi = Math.min(ceiling, Math.max(maxTokens * 4, 64));
+  while (hi < ceiling && countTokens(text.slice(0, hi)) <= maxTokens) {
+    lo = hi;
+    hi = Math.min(ceiling, hi * 2);
+  }
+  if (hi === ceiling && countTokens(text.slice(0, ceiling)) <= maxTokens) {
+    // Either the whole remaining text fits, or the window cap itself does
+    // (extremely compressible content) — either way, stop growing rather
+    // than tokenize an ever-larger slice.
+    return ceiling;
+  }
+
+  // Binary search the final interval: lo fits, hi doesn't.
+  while (lo < hi - 1) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (countTokens(text.slice(0, mid)) <= maxTokens) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
+/**
+ * Last-resort splitter for a piece no natural separator can bring under
+ * `maxTokens` (see `splitRecursive`'s give-up branch and `blockToPieces`'s
+ * code/table line-split fallback, when even a single line is oversized).
+ * Iterative (not recursive) for the same reason `findHardSplitEnd` avoids
+ * tokenizing the full remaining text: a recursive version's own base-case
+ * check (`countTokens(text) <= maxTokens`) would itself be an O(remaining
+ * length) call at every one of the many pieces a large oversized run
+ * produces, which is exactly the same O(n^2) trap `findHardSplitEnd`
+ * avoids internally. Surrogate-pair-safe via `safePrefixEnd`.
+ */
+function hardSplit(text: string, start: number, countTokens: (text: string) => number, maxTokens: number): Piece[] {
+  const pieces: Piece[] = [];
+  let pos = 0;
+  while (pos < text.length) {
+    const remaining = text.length - pos;
+    const cutLen = remaining <= 1 ? remaining : findHardSplitEnd(text.slice(pos), countTokens, maxTokens);
+    const safeCutLen = Math.min(Math.max(safePrefixEnd(text, pos + cutLen) - pos, 1), remaining);
+    pieces.push({ text: text.slice(pos, pos + safeCutLen), start: start + pos, end: start + pos + safeCutLen, atomic: false });
+    pos += safeCutLen;
+  }
+  return pieces;
 }
 
 function blockToPieces(
@@ -306,7 +463,15 @@ function blockToPieces(
       return { pieces: [{ text: raw, start: block.start, end: block.end, atomic: true }], headingPath: pathed.headingPath };
     }
     const lineParts = splitPreservingOffsets(raw, block.start, /\n/g);
-    const pieces = lineParts.map((p) => ({ text: p.text, start: p.start, end: p.end, atomic: true }));
+    // A single line can itself still exceed maxTokens (a minified file, a
+    // very long log line) — line-splitting alone doesn't guarantee the
+    // hard cap either, so fall back to hardSplit for any line that's
+    // still oversized, same as splitRecursive's own last resort.
+    const pieces = lineParts.flatMap((p) =>
+      countTokens(p.text) > maxTokens
+        ? hardSplit(p.text, p.start, countTokens, maxTokens).map((piece) => ({ ...piece, atomic: true }))
+        : [{ text: p.text, start: p.start, end: p.end, atomic: true }],
+    );
     return { pieces, headingPath: pathed.headingPath };
   }
 
@@ -529,7 +694,12 @@ export function chunkDocument(title: string, content: string, options: ChunkOpti
         lo = mid + 1;
       }
     }
-    span.contentStart = lo;
+    // `lo` is a UTF-16 index computed purely from token-count budget, not
+    // a real character boundary — unlike splitPreservingOffsets's regex
+    // matches, it can land inside a surrogate pair (an astral character,
+    // most emoji). See docs/DECISIONS.md for the corrupted-citation repro
+    // this fixes.
+    span.contentStart = safeSuffixStart(normalizedText, lo);
   }
 
   // Materialize chunks with original-coordinate offsets.
@@ -573,7 +743,11 @@ function findOverlapStart(prevText: string, overlapBudgetTokens: number, countTo
       lo = mid + 1;
     }
   }
-  const rawStart = lo;
+  // `lo` is a UTF-16 index computed purely from token-count budget, not a
+  // real character boundary — it can land inside a surrogate pair (an
+  // astral character, most emoji). See docs/DECISIONS.md for the
+  // corrupted-citation repro this fixes.
+  const rawStart = safeSuffixStart(prevText, lo);
 
   // Prefer snapping forward to the nearest sentence boundary within the
   // slice, so the overlap reads naturally rather than starting mid-word.

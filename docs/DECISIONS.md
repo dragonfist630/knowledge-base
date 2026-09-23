@@ -2674,3 +2674,50 @@ deferred). One reported "bug" (a claimed race in `useConversation`'s
 query key) did not reproduce and was dropped — TanStack Query's own
 query-key-based cache dedup already serializes those reads correctly.
 
+### D9.4 — `packages/rag-core`: chunk-size cap violation and UTF-16 corruption, both fixed
+
+Agent 2 flagged that `chunker.ts`'s oversized-text handling looked
+suspicious. Verified two real, independent bugs in `splitRecursive`'s
+handling of text that doesn't fit within any of `SPLIT_SEPARATORS`'s
+levels:
+
+1. **Critical: the `maxTokens` cap was silently violated.** Once recursion
+   ran out of separator levels, the oversized remainder was returned
+   as-is, uncut — confirmed live: a 2,960-character CJK document (no
+   whitespace for the separator levels to split on) with `maxTokens: 80`
+   produced a single ~2,000-token piece, 25x over the caller's own limit.
+   Any caller relying on the contract "no piece exceeds `maxTokens`" (the
+   embedding provider's own request-size limit, for one) would silently
+   send an oversized request. Fixed by adding `hardSplit` — an iterative,
+   character-budget-driven splitter — as the final fallback once
+   separator-based splitting is exhausted (`chunker.ts` lines ~298-440);
+   `splitOversized`'s last level now calls it instead of returning the
+   oversized text untouched.
+2. **High: UTF-16 surrogate-pair corruption.** The binary searches that
+   locate cut points (`findOverlapStart`'s search and the chunk-boundary
+   safety net) operated on raw UTF-16 code-unit indices with no awareness
+   that most emoji occupy a high+low surrogate pair — a cut landing
+   between the two produces a lone surrogate, which silently becomes
+   U+FFFD (replacement character) the moment it's encoded to UTF-8 (e.g.
+   on the way into Postgres). Fuzzed 100 trials of emoji-heavy text against
+   the pre-fix code: 60 of 100 produced at least one lone surrogate in some
+   chunk. Fixed with `safeSuffixStart`/`safePrefixEnd` helpers (lines
+   ~342-370) that nudge a cut index off a low-surrogate code unit before
+   using it, applied at both search sites.
+
+Fixing (1) with a naive binary search over `[0, text.length]` reintroduced
+a performance regression the hard way: `countTokens` (the real
+`gpt-tokenizer`) was being called on slices up to the full remaining text
+length repeatedly, and `node --prof` profiling traced a further,
+genuinely superlinear cost inside the tokenizer's own BPE merge on highly
+repetitive text. Resolved with a galloping/exponential search
+(`findHardSplitEnd`) bounded by `HARD_SPLIT_WINDOW_CAP = 8000` characters
+(line 393) plus eliminating a redundant `countTokens` re-check `chunker.ts`
+was making on the same unchanged oversized text at each of 4 separator
+levels. Verified: a CJK document chunks in ~25ms, a realistic 100,000-char
+non-repetitive blob in ~200ms; only pathological single/dual-character
+repeated blobs (not realistic content) remain slow, a documented,
+unfixed `gpt-tokenizer` characteristic rather than a chunker bug. Both
+bugs have non-vacuous regression tests in `chunker.spec.ts` (proven to
+fail against the pre-fix code, pass against the fix); full suite 45/45.
+

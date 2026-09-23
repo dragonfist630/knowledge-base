@@ -218,4 +218,79 @@ describe("chunkDocument", () => {
     const chunks = chunkDocument("Index Doc", content, { minTrailingTokens: 0 });
     chunks.forEach((chunk, i) => expect(chunk.chunkIndex).toBe(i));
   });
+
+  it("enforces the hard maxTokens cap even for text with no natural separator (CJK prose, a long base64/URL-style blob)", () => {
+    // CJK sentences have no ASCII inter-word spaces and don't end in
+    // `.`/`!`/`?`, so none of splitRecursive's separators (blank line,
+    // newline, sentence end, whitespace) can ever split them — before the
+    // fix, splitRecursive gave up once it exhausted every separator level
+    // and returned the whole run as one chunk, silently blowing past
+    // maxTokens (confirmed live: a 2,960-character CJK document produced
+    // one 2,000-token chunk against maxTokens: 80). See docs/DECISIONS.md.
+    const cjkSentence = "这是一个非常长的中文句子用来测试分块器是否能够正确处理没有空格的文本内容";
+    const cjkDoc = `${cjkSentence}。`.repeat(80);
+    const cjkChunks = chunkDocument("CJK Doc", cjkDoc, { maxTokens: 80, targetTokens: 60, overlapTokens: 10 });
+    expect(cjkChunks.length).toBeGreaterThan(1);
+    for (const chunk of cjkChunks) {
+      expect(chunk.tokenCount).toBeLessThanOrEqual(80);
+      expect(countTokens(chunk.content)).toBeLessThanOrEqual(80);
+    }
+
+    // Same failure mode for a long unbroken run with no CJK involved at
+    // all — a base64 blob or a bare URL/hash is just as unsplittable by
+    // whitespace/punctuation. Also stands in as a performance regression
+    // guard: a naive fix (binary-searching the full remaining text on
+    // every cut) made splitting a large oversized run pathologically slow
+    // — confirmed live at ~4s for a 20,000-character unbroken run, vs. a
+    // few ms after — see docs/DECISIONS.md, including a separate,
+    // NOT-fixed-here observation about gpt-tokenizer's own elevated
+    // per-call cost on long runs of highly repetitive (near-single-
+    // character) content specifically, distinct from this bug.
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let blob = "";
+    for (let i = 0; i < 100_000; i += 1) blob += alphabet[(i * 37 + 13) % alphabet.length];
+    const blobChunks = chunkDocument("Blob Doc", blob, { maxTokens: 80, targetTokens: 60, overlapTokens: 10 });
+    expect(blobChunks.length).toBeGreaterThan(1);
+    for (const chunk of blobChunks) {
+      expect(chunk.tokenCount).toBeLessThanOrEqual(80);
+    }
+  });
+
+  it("never splits a UTF-16 surrogate pair (emoji, other astral characters) when computing chunk overlap", () => {
+    // The overlap/trim binary searches cut at a raw token-budget-driven
+    // UTF-16 index, unrelated to any real character boundary — unlike
+    // splitPreservingOffsets's regex matches. Before the fix, this could
+    // land inside a surrogate pair (most emoji are 2 UTF-16 units),
+    // producing a chunk that starts or ends with a lone surrogate: invalid
+    // UTF-16, silently corrupted to U+FFFD once persisted as UTF-8, and
+    // surfaced to users as a "verbatim" citation snippet it never was.
+    // Confirmed live via fuzzing (60 lone surrogates across 100 synthetic
+    // emoji-heavy documents before this fix, 0 after). See
+    // docs/DECISIONS.md.
+    const emojis = ["🚀", "🔥", "💯", "😀", "🎉", "🌟", "✨", "💪", "🙌", "👍", "🍕", "🐉", "🦄", "🎯", "🧠"];
+    let foundLoneSurrogate = false;
+    for (let trial = 0; trial < 40 && !foundLoneSurrogate; trial += 1) {
+      let text = "";
+      for (let i = 0; i < 2000; i += 1) {
+        text += emojis[(i + trial) % emojis.length];
+        if (i % 37 === 0) text += ". ";
+      }
+      const chunks = chunkDocument("Emoji Doc", text, { maxTokens: 60, targetTokens: 40, overlapTokens: 15 });
+      for (const chunk of chunks) {
+        for (let i = 0; i < chunk.content.length; i += 1) {
+          const code = chunk.content.charCodeAt(i);
+          const isHigh = code >= 0xd800 && code <= 0xdbff;
+          const isLow = code >= 0xdc00 && code <= 0xdfff;
+          if (isHigh) {
+            const next = chunk.content.charCodeAt(i + 1);
+            if (!(next >= 0xdc00 && next <= 0xdfff)) foundLoneSurrogate = true;
+          } else if (isLow) {
+            const prev = chunk.content.charCodeAt(i - 1);
+            if (!(prev >= 0xd800 && prev <= 0xdbff)) foundLoneSurrogate = true;
+          }
+        }
+      }
+    }
+    expect(foundLoneSurrogate).toBe(false);
+  });
 });
