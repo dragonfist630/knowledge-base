@@ -25,6 +25,18 @@ export interface RpcChunkInput {
   embedding: string;
 }
 
+export interface IndexingJobInput {
+  documentId: string;
+  contentHash: string;
+}
+
+/** A job row `claim_indexing_jobs` just flipped to 'processing' for this caller. */
+export interface ClaimedIndexingJob {
+  documentId: string;
+  contentHash: string;
+  attempts: number;
+}
+
 export interface UsageEventInput {
   operation: "embedding" | "chat" | "query_rewrite";
   provider: string;
@@ -51,6 +63,79 @@ export class IndexingRepository {
     const { data, error } = await db.from("documents").select("id, title, content, content_hash").eq("id", id).maybeSingle();
     if (error) throw error;
     return data ? { id: data.id, title: data.title, content: data.content, contentHash: data.content_hash } : null;
+  }
+
+  /**
+   * Durably enqueues (or replaces) the indexing job for one document — a
+   * plain upsert keyed on `document_id` (the table's primary key, see the
+   * migration), so a document that already has a pending/processing job
+   * gets that job's content_hash/status/attempts/error reset to a fresh
+   * 'pending' state rather than queuing a second row. This is what gives
+   * "latest edit wins, one job per document" semantics without any extra
+   * logic — the same guarantee the old in-memory queue's `pendingByDocument`
+   * Map gave for free, now durable across a restart.
+   */
+  async enqueueJob(db: SupabaseClient<Database>, job: IndexingJobInput): Promise<void> {
+    const { error } = await db.from("document_indexing_jobs").upsert(
+      {
+        document_id: job.documentId,
+        content_hash: job.contentHash,
+        status: "pending",
+        locked_at: null,
+        attempts: 0,
+        error: null,
+      },
+      { onConflict: "document_id" },
+    );
+    if (error) throw error;
+  }
+
+  /**
+   * Atomically claims up to `limit` of the CALLING USER's own pending (or
+   * stale-processing) jobs via the `claim_indexing_jobs` RPC — see that
+   * function's own comment in the migration for the `for update skip
+   * locked` mechanics. RLS means this can only ever return rows this
+   * caller's own JWT is entitled to see, same as every other method here.
+   */
+  async claimJobs(db: SupabaseClient<Database>, limit: number, staleAfterSeconds: number): Promise<ClaimedIndexingJob[]> {
+    const { data, error } = await db.rpc("claim_indexing_jobs", {
+      p_limit: limit,
+      p_stale_after: `${staleAfterSeconds} seconds`,
+    });
+    if (error) throw error;
+    return (data ?? []).map((row) => ({ documentId: row.document_id, contentHash: row.content_hash, attempts: row.attempts }));
+  }
+
+  /**
+   * Deletes a job row on successful completion — guarded by `content_hash`
+   * so a job that finishes processing an OLD version of the document,
+   * after a newer edit already upserted a fresh 'pending' row for the new
+   * content_hash, can't delete that newer job out from under it. A 0-row
+   * delete here is a silent, expected no-op in exactly that race, mirroring
+   * `replace_document_chunks`'s own content_hash guard.
+   */
+  async completeJob(db: SupabaseClient<Database>, documentId: string, contentHash: string): Promise<void> {
+    const { error } = await db
+      .from("document_indexing_jobs")
+      .delete()
+      .eq("document_id", documentId)
+      .eq("content_hash", contentHash);
+    if (error) throw error;
+  }
+
+  /**
+   * Records a failed attempt — same `content_hash` guard as `completeJob`,
+   * for the same reason: a stale failure for a since-superseded content
+   * version must not stomp the fresh 'pending' row a newer edit already
+   * created.
+   */
+  async failJob(db: SupabaseClient<Database>, documentId: string, contentHash: string, message: string): Promise<void> {
+    const { error } = await db
+      .from("document_indexing_jobs")
+      .update({ status: "failed", error: message })
+      .eq("document_id", documentId)
+      .eq("content_hash", contentHash);
+    if (error) throw error;
   }
 
   /**

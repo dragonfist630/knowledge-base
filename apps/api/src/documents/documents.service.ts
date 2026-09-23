@@ -44,39 +44,38 @@ export class DocumentsService {
   }
 
   /**
-   * Crash recovery for IndexingQueue, which is in-process and in-memory
-   * (see indexing.queue.ts's docstring): if the API restarts while a
-   * document is 'pending' or 'indexing', that job is gone and nothing will
-   * ever pick it back up on its own.
+   * Crash recovery for the indexing pipeline. Updated for D9.14: what used
+   * to re-enqueue from `documents.index_status` (querying `documents`
+   * directly for anything still 'pending'/'indexing') now claims directly
+   * from the durable `document_indexing_jobs` table via
+   * `IndexingQueue.kick()` — the job table is now the source of truth for
+   * "is there indexing work outstanding", not `documents.index_status`.
    *
-   * A boot-time sweep can't fix this by itself: RLS means any query only
-   * ever sees ONE user's documents under THAT user's JWT, and at boot
-   * there is no user's JWT to run it with — the only way around that would
-   * be a service-role client, which this app deliberately has nowhere
-   * (see docs/DECISIONS.md; D3.6 exists specifically because a forged
-   * service-role token is dangerous). So instead of a boot-time sweep,
-   * this runs lazily, scoped to whichever user is making a request right
-   * now, using THEIR OWN already-verified JWT — which never sees, and
-   * never needs to see, any other user's documents.
+   * `kick()`'s claim (`claim_indexing_jobs`) already atomically picks up
+   * this user's own 'pending' jobs AND any 'processing' job that's gone
+   * stale (its owning process died mid-job) — see the migration and
+   * indexing.queue.ts. There is still no boot-time sweep and still can't
+   * be one: RLS means any query only ever sees ONE user's rows under THAT
+   * user's JWT, and at boot there is no user's JWT to run it with — the
+   * only way around that would be a service-role client, which this app
+   * deliberately has nowhere (D3.6: a forged service-role token is
+   * dangerous). So this still runs lazily, scoped to whichever user is
+   * making a request right now, using THEIR OWN already-verified JWT —
+   * which never sees, and never needs to see, any other user's documents.
    *
-   * Re-enqueuing a document that's already actively processing in this
-   * same process is a safe, cheap no-op (IndexingQueue.isActive), so this
-   * is fine to call on every list()/getById(). See docs/DECISIONS.md Phase
-   * 4 for the full trade-off writeup, including the one residual gap this
-   * leaves: a document whose owner never makes another request stays
-   * stuck until they do.
+   * `count: 2` matches IndexingQueue's own local concurrency limit, so a
+   * user with several stuck documents gets them all picked up (each an
+   * independent, atomic claim) rather than just the first. Calling this on
+   * every list()/getById() is cheap: a claim that finds nothing is a
+   * single no-op query. See docs/DECISIONS.md D9.14 and docs/SCALING.md
+   * item 1 for the residual gap this still leaves — a document whose owner
+   * never makes another request stays stuck until they do.
    */
   private async resumeStuckIndexing(auth: AuthContext): Promise<void> {
-    let stuck: { id: string; content_hash: string }[];
     try {
-      stuck = await this.repository.findStuckIndexing(auth.db);
+      this.indexingQueue.kick(auth.db, 2);
     } catch {
       // Best-effort only — a sweep failure must never break a normal read.
-      return;
-    }
-    for (const doc of stuck) {
-      if (this.indexingQueue.isActive(doc.id)) continue;
-      this.indexingQueue.enqueue({ documentId: doc.id, contentHash: doc.content_hash, userJwt: auth.jwt });
     }
   }
 

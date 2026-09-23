@@ -155,6 +155,50 @@ export type Database = {
           },
         ]
       }
+      document_indexing_jobs: {
+        Row: {
+          attempts: number
+          content_hash: string
+          created_at: string
+          document_id: string
+          error: string | null
+          locked_at: string | null
+          status: string
+          updated_at: string
+          user_id: string
+        }
+        Insert: {
+          attempts?: number
+          content_hash: string
+          created_at?: string
+          document_id: string
+          error?: string | null
+          locked_at?: string | null
+          status?: string
+          updated_at?: string
+          user_id?: string
+        }
+        Update: {
+          attempts?: number
+          content_hash?: string
+          created_at?: string
+          document_id?: string
+          error?: string | null
+          locked_at?: string | null
+          status?: string
+          updated_at?: string
+          user_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "document_indexing_jobs_document_id_fkey"
+            columns: ["document_id"]
+            isOneToOne: true
+            referencedRelation: "documents"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       documents: {
         Row: {
           chunk_count: number
@@ -258,6 +302,17 @@ export type Database = {
       [_ in never]: never
     }
     Functions: {
+      claim_indexing_jobs: {
+        Args: {
+          p_limit?: number
+          p_stale_after?: string
+        }
+        Returns: {
+          attempts: number
+          content_hash: string
+          document_id: string
+        }[]
+      }
       match_document_chunks: {
         Args: {
           filter_document_ids?: string[]

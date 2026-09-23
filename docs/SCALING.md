@@ -5,36 +5,63 @@ a generic "how to scale a RAG app" essay. Every item below is grounded in a
 specific implementation choice documented in `docs/ARCHITECTURE.md` or
 `docs/DECISIONS.md`. Ranked roughly by which limit you'd hit first.
 
-## 1. The indexing queue can't survive more than one `apps/api` process
+## 1. The indexing queue is now durable and multi-replica-safe — but still only ever runs request-adjacent
 
-`IndexingQueue` is an in-memory `p-queue`, concurrency 2, living inside the
-same process that serves HTTP requests. This is the single biggest
-structural limit on this app's scale, for two separate reasons:
+Updated (D9.14, Phase 9): `IndexingQueue` used to be a purely in-memory
+`p-queue` living inside the request-serving process — a restart silently
+dropped every queued job, and two `apps/api` replicas would each believe
+they alone owned the world. That's fixed: `document_indexing_jobs` (see
+`supabase/migrations/*_document_indexing_jobs.sql`) is a durable,
+RLS-scoped Postgres table, and a new `claim_indexing_jobs` RPC
+(`security invoker`, `for update skip locked`) claims jobs atomically —
+verified under real concurrent transactions, not just reasoned about, see
+`docs/DECISIONS.md` D9.14.
 
-- **You can't run `apps/api` as more than one replica without breaking its
-  own guarantees.** The "latest job wins, one job per document at a time"
-  logic and the stuck-job tracking both assume there is exactly one queue.
-  Two replicas would each have their own independent queue and could
-  process the same document concurrently — `replace_document_chunks`'s
-  `content_hash` guard would stop them from corrupting each other's writes,
-  but you'd be doing the embedding work (real API calls, real cost) twice
-  for no benefit.
-- **A process restart silently drops every queued job.** Nothing is
-  persisted. The lazy `resumeStuckIndexing` sweep (see Architecture)
-  recovers from this, but only when the affected user happens to load their
-  documents list again — there's no guarantee that happens promptly, or at
-  all for an abandoned account.
+**What's actually fixed now:**
 
-**What this means in practice**: today, one `apps/api` instance can index
-at most 2 documents at once, system-wide, across every user — not per user.
-A burst of uploads from multiple users queues up behind that limit.
+- **Two `apps/api` replicas no longer duplicate embedding work.** Whichever
+  replica's `claim_indexing_jobs` call commits first gets the job; every
+  other concurrent claim — same replica or a different one — atomically
+  skips it (`for update skip locked`) and returns nothing. The "you'd be
+  doing the embedding work twice for no benefit" scenario this item used to
+  describe is closed.
+- **A process restart no longer drops queued work.** The job is a Postgres
+  row, not a Node `Map` entry — it survives the crash that would have taken
+  the old in-memory queue's state with it.
 
-**The fix, if this becomes a real constraint**: move indexing off the
-request-serving process entirely, onto a real job system with persistence
-— either `pg-boss` (runs on the same Postgres already in use, no new
-infra) or a dedicated broker (Redis + BullMQ) with its own worker
-process(es). That also removes the "must be the same process" constraint
-on `apps/api` itself, letting it scale horizontally.
+**What's still true, and structurally has to stay true:** there is still
+no boot-time or timer-driven background worker, and there structurally
+can't be one without reopening a risk this app has avoided since Phase 1.
+Every Postgres access here runs as some real user's own, already-verified
+JWT — RLS is the *only* authorization boundary anywhere in `apps/api`
+(D3.6) — and a generic poller with no request behind it has no such JWT to
+run as. So claiming a job only ever happens two ways: immediately after
+`enqueue()`, using the JWT that request just authenticated with; or via
+`documents.service.ts`'s lazy `resumeStuckIndexing` sweep on the next
+`list()`/`getById()` call from *any* request for that same user (now
+claiming from the durable table, not re-deriving stuck-ness from
+`documents.index_status`). **A document whose owner never makes another
+request after a crash still stays stuck until they do** — this was true
+before D9.14 and remains true after it; what changed is that the job is
+now guaranteed to still be there, correctly claimable, whenever that next
+request finally arrives, and that two replicas racing to pick it up can no
+longer both succeed.
+
+**What this means in practice**: one `apps/api` instance still indexes at
+most 2 documents at once, system-wide (the local `p-queue` concurrency
+limit is unchanged) — but now that limit is genuinely a per-replica local
+concurrency cap, not a correctness assumption. Running `apps/api` at
+`replicas: 2+` is safe from a duplicate-work/corruption standpoint in a way
+it wasn't before this entry; there is still no deploy target that actually
+runs more than one replica (see `docs/DEPLOYMENT.md`), so this is a closed
+correctness question, not yet an exercised one.
+
+**The one thing that would still need building, if "no worker until the
+next request" ever becomes the real constraint**: not a generic background
+poller (that's the option D3.6 already ruled out for this app), but a
+scheduled trigger that authenticates as a specific user on a timer — a
+narrower, differently-scoped feature than "a background worker," and one
+this project hasn't needed yet.
 
 ## 2. Rate limiting is per-process, not global
 
@@ -119,25 +146,31 @@ configured provider takes to respond. This scales with usage roughly
 linearly and isn't something the app's own architecture can improve —
 provider choice (`docs/PROVIDERS.md`), not code, is the lever here.
 
-## 7. There's now a way to run one instance of each app — multi-replica scaling still has nothing to exercise it
+## 7. Packaging exists (D9.13); the indexing-queue correctness blocker is now fixed too (D9.14) — only a deploy target is still missing
 
-Updated (D9.13, Phase 9): `apps/api/Dockerfile` and `apps/web/Dockerfile`
-now exist, and `.github/workflows/ci.yml` builds both on every push — see
-`docs/ARCHITECTURE.md`'s "Deployment shape as it exists today" and
-`docs/DEPLOYMENT.md`. That closes "there's no way to even package this,"
-which used to be the literal first blocker here. It does NOT close this
-item's actual scaling concern: `apps/api`'s in-memory `IndexingQueue`
-still means exactly one instance, no more, can safely run at a time (a
-second replica would silently split document-save requests and
-`resumeStuckIndexing` sweeps across two independent, unaware-of-each-other
-queues — see `docs/ARCHITECTURE.md`). None of the scaling levers above
-(multiple `apps/api` replicas, a shared rate-limit store, a real job
-queue) can be exercised until that gets a real fix — a persisted job queue
-(the obvious candidate: a `document_indexing_jobs` table plus a poll loop,
-so any instance can pick up a stuck job, not just the one that enqueued
-it) is still deliberately unbuilt, not merely unautomated. No deploy
-target (a host, a Kubernetes cluster, an autoscaling group) exists to run
-more than one instance on yet either, even if the queue were fixed first.
+Updated (D9.13, then D9.14, Phase 9): `apps/api/Dockerfile` and
+`apps/web/Dockerfile` exist, and `.github/workflows/ci.yml` builds both on
+every push — see `docs/ARCHITECTURE.md`'s "Deployment shape as it exists
+today" and `docs/DEPLOYMENT.md`. That closed "there's no way to even
+package this," which used to be the literal first blocker here.
+
+D9.14 then closed what this item used to describe as the remaining
+correctness blocker: `apps/api`'s indexing queue is no longer in-memory
+(see item 1, above, for the full writeup) — a second replica claiming
+document-save indexing work via `claim_indexing_jobs` can no longer
+silently duplicate another replica's work or lose it on restart. Two
+`apps/api` replicas behind a load balancer would no longer corrupt or
+duplicate indexing work purely by both existing.
+
+What's still genuinely missing is everything item 1 already says isn't
+fixed and can't be by this app's own design: there's still no background
+worker independent of a live request (only request-adjacent claiming —
+see item 1), and, separately and more simply, **no deploy target exists at
+all** — no host, no Kubernetes cluster, no autoscaling group configured to
+actually run more than one `apps/api` replica. The scaling levers item 2
+(shared rate-limit store) and item 3 (long-lived-connection-aware load
+balancing) describe are now safe to exercise from an indexing-correctness
+standpoint, but still have nothing to run them against.
 
 ## What's already handled well, and doesn't need revisiting for scale
 

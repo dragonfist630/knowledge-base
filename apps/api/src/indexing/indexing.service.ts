@@ -7,15 +7,14 @@ import type { EmbeddingModel, TokenUsage } from "@kb/ai";
 import type { Database } from "@kb/shared";
 import type { SupabaseClient } from "@supabase/supabase-js";
 
-import { createUserScopedClient } from "../auth/supabase-client.factory.js";
 import { API_ENV } from "../config/config.module.js";
 import type { ApiEnv } from "../config/env.js";
 // IndexingQueue and IndexingRepository must stay value imports
 // (constructor-injected) — see docs/DECISIONS.md Phase 3, D3.3.
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
-import { IndexingQueue, type IndexingJob } from "./indexing.queue.js";
+import { IndexingQueue } from "./indexing.queue.js";
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
-import { IndexingRepository, type RpcChunkInput } from "./indexing.repository.js";
+import { IndexingRepository, type ClaimedIndexingJob, type RpcChunkInput } from "./indexing.repository.js";
 // EMBEDDING_MODEL is a DI token (symbol), not a class — always a value.
 import { EMBEDDING_MODEL } from "../ai/ai.module.js";
 
@@ -25,11 +24,14 @@ import { EMBEDDING_MODEL } from "../ai/ai.module.js";
  * rather than being constructor-injected INTO the queue, to avoid a
  * circular dependency — see indexing.queue.ts's docstring.
  *
- * Every step runs against a Supabase client scoped to the JOB'S OWN JWT
- * (captured by documents.service at enqueue time, not the JWT of whoever
- * happens to trigger processing), so indexing always runs under the same
- * RLS as the user who owns the document — there is still no service-role
- * client anywhere in this app.
+ * D9.14: every step now runs against whatever client `IndexingQueue`
+ * claimed the job with (a real, live, already-verified request's own
+ * JWT — see indexing.queue.ts), not a client rebuilt from a JWT stored on
+ * the job row (there isn't one). This method itself is otherwise unchanged
+ * from Phase 4: same chunk -> embed -> replace_document_chunks pipeline,
+ * same content_hash staleness guards. What's new is the job-row bookkeeping
+ * at the end — `document_indexing_jobs` needs its own completion/failure
+ * write now, alongside the existing `documents.index_status` one.
  */
 interface UsageResult extends TokenUsage {
   latencyMs: number;
@@ -47,24 +49,25 @@ export class IndexingService implements OnModuleInit {
   ) {}
 
   onModuleInit(): void {
-    this.queue.setProcessor((job) => this.process(job));
+    this.queue.setProcessor((db, job) => this.process(db, job));
   }
 
-  async process(job: IndexingJob): Promise<void> {
-    const db = createUserScopedClient(this.env, job.userJwt);
-
+  async process(db: SupabaseClient<Database>, job: ClaimedIndexingJob): Promise<void> {
     try {
       const document = await this.repository.findForIndexing(db, job.documentId);
       if (!document) {
         // Deleted (or no longer visible under this user's RLS) since this
-        // job was enqueued — nothing left to index.
+        // job was claimed — nothing left to index. The job row is gone too
+        // (document_indexing_jobs.document_id cascades on document delete).
         return;
       }
       if (document.contentHash !== job.contentHash) {
-        // A newer save has already superseded this job. Shouldn't normally
-        // happen — IndexingQueue only ever keeps the latest job per
-        // document — but staying a safe no-op if it ever does mirrors the
-        // same guard replace_document_chunks applies at write time.
+        // A newer save already upserted a fresh 'pending' row for this
+        // document (see documents.service.ts's update()) sometime between
+        // this job being claimed and this check running. Stop here and
+        // leave that newer row alone — completing/failing below is guarded
+        // by content_hash for exactly this race, but there's nothing valid
+        // left for THIS job to write anyway.
         return;
       }
 
@@ -101,6 +104,16 @@ export class IndexingService implements OnModuleInit {
       if (embedded) {
         await this.recordUsageBestEffort(db, job, embedded.usage);
       }
+
+      // Clears this job's row — guarded by content_hash, so if `wrote` was
+      // false because a newer job already superseded this one, this is a
+      // safe no-op that leaves that newer 'pending' row untouched (see
+      // IndexingRepository.completeJob). Best-effort: the chunk write
+      // above is what actually matters and has already landed either way;
+      // a failure to also clear the job row just leaves it to be picked up
+      // again by a later claim, which will find document.contentHash still
+      // matches, redo the (now cheap, unchanged) work, and succeed.
+      await this.completeJobBestEffort(db, job);
     } catch (error) {
       await this.handleFailure(db, job, error);
     }
@@ -136,7 +149,7 @@ export class IndexingService implements OnModuleInit {
    * happened — it must never be able to turn an otherwise-successful
    * indexing pass into a 'failed' one. See docs/DECISIONS.md Phase 4.
    */
-  private async recordUsageBestEffort(db: SupabaseClient<Database>, job: IndexingJob, usage: UsageResult): Promise<void> {
+  private async recordUsageBestEffort(db: SupabaseClient<Database>, job: ClaimedIndexingJob, usage: UsageResult): Promise<void> {
     try {
       await this.repository.recordUsage(db, {
         operation: "embedding",
@@ -157,7 +170,18 @@ export class IndexingService implements OnModuleInit {
     }
   }
 
-  private async handleFailure(db: SupabaseClient<Database>, job: IndexingJob, error: unknown): Promise<void> {
+  private async completeJobBestEffort(db: SupabaseClient<Database>, job: ClaimedIndexingJob): Promise<void> {
+    try {
+      await this.repository.completeJob(db, job.documentId, job.contentHash);
+    } catch (error) {
+      this.logger.warn(
+        `Indexed document ${job.documentId} successfully but failed to clear its job row — a later claim will redo the (now cheap) work.`,
+        error instanceof Error ? error.stack : error,
+      );
+    }
+  }
+
+  private async handleFailure(db: SupabaseClient<Database>, job: ClaimedIndexingJob, error: unknown): Promise<void> {
     this.logger.error(
       `Indexing failed for document ${job.documentId}.`,
       error instanceof Error ? error.stack : error,
@@ -175,6 +199,15 @@ export class IndexingService implements OnModuleInit {
     } catch (markError) {
       this.logger.error(
         `Also failed to record the failure itself for document ${job.documentId}.`,
+        markError instanceof Error ? markError.stack : markError,
+      );
+    }
+
+    try {
+      await this.repository.failJob(db, job.documentId, job.contentHash, message);
+    } catch (markError) {
+      this.logger.error(
+        `Also failed to record the failure on the job row itself for document ${job.documentId}.`,
         markError instanceof Error ? markError.stack : markError,
       );
     }

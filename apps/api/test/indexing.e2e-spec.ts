@@ -11,6 +11,7 @@ import request from "supertest";
 
 import { EMBEDDING_MODEL } from "../src/ai/ai.module.js";
 import { AppModule } from "../src/app.module.js";
+import { computeContentHash } from "../src/documents/documents.service.js";
 import { waitFor } from "./e2e/wait-for.js";
 
 /** Any embed() input containing this string simulates a provider outage — see ControllableEmbeddingModel below. */
@@ -210,5 +211,73 @@ describe("Indexing pipeline (e2e)", () => {
       .post(`/documents/${docId}/reindex`)
       .set("Authorization", authed(userA.jwt))
       .expect(201);
+  });
+
+  /**
+   * D9.14: the actual point of the persisted document_indexing_jobs table
+   * (replacing the old in-memory IndexingQueue) is that a job survives
+   * even when nothing local ever processes it. These two cases bypass
+   * documents.service.ts's normal create()/enqueue() path entirely — using
+   * userADb directly to insert a document and a document_indexing_jobs row
+   * for it exactly the way an apps/api process's write WOULD have landed
+   * a split second before that same process died, before its own local
+   * kick() ever got to run — and then prove a la carte that a completely
+   * unrelated later request (GET /documents/:id, which every read already
+   * calls resumeStuckIndexing from) is what actually gets the document
+   * indexed, with no direct call to anything indexing-specific.
+   */
+  it("a job left 'pending' with no local worker ever having run it still gets indexed by a later, unrelated request's crash-recovery sweep", async () => {
+    const title = "Orphaned Pending Job Doc";
+    const content = "This document's row was written directly, simulating a process that died right after committing its enqueue but before ever attempting to process it.";
+    const contentHash = computeContentHash(title, content);
+
+    const { data: doc, error: docError } = await userADb
+      .from("documents")
+      .insert({ title, content, content_hash: contentHash, index_status: "pending" })
+      .select("id")
+      .single();
+    expect(docError).toBeNull();
+    const docId = doc!.id;
+
+    const { error: jobError } = await userADb
+      .from("document_indexing_jobs")
+      .insert({ document_id: docId, content_hash: contentHash });
+    expect(jobError).toBeNull();
+
+    // No enqueue(), no kick() — the ONLY thing that can possibly get this
+    // document indexed from here is some later request's resumeStuckIndexing
+    // sweep noticing the durable job row and claiming it.
+    const ready = await waitFor(() => getDoc(docId), (d) => d.indexStatus === "ready", {
+      label: "orphaned pending job doc",
+    });
+    expect(ready.chunkCount).toBeGreaterThan(0);
+
+    const { data: jobRow } = await userADb.from("document_indexing_jobs").select("document_id").eq("document_id", docId).maybeSingle();
+    expect(jobRow).toBeNull(); // completeJob deleted it once processed
+  });
+
+  it("a job stuck 'processing' past the staleness window (its claiming worker died mid-job) is reclaimed and completed by a later sweep", async () => {
+    const title = "Stale Processing Job Doc";
+    const content = "This document's job row was written directly as already-processing-but-ancient, simulating a worker that claimed it and then crashed mid-job.";
+    const contentHash = computeContentHash(title, content);
+
+    const { data: doc, error: docError } = await userADb
+      .from("documents")
+      .insert({ title, content, content_hash: contentHash, index_status: "indexing" })
+      .select("id")
+      .single();
+    expect(docError).toBeNull();
+    const docId = doc!.id;
+
+    const staleLockedAt = new Date(Date.now() - 60 * 60 * 1000).toISOString(); // 1 hour ago — well past the 5-minute staleness window
+    const { error: jobError } = await userADb
+      .from("document_indexing_jobs")
+      .insert({ document_id: docId, content_hash: contentHash, status: "processing", locked_at: staleLockedAt, attempts: 1 });
+    expect(jobError).toBeNull();
+
+    const ready = await waitFor(() => getDoc(docId), (d) => d.indexStatus === "ready", {
+      label: "stale processing job doc",
+    });
+    expect(ready.chunkCount).toBeGreaterThan(0);
   });
 });

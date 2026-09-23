@@ -2,10 +2,10 @@
 
 A from-the-code description of how this app is actually built, not how a
 generic RAG app might be built. Every claim here is sourced from a specific
-file; where something doesn't exist (a queue worker, a deploy target beyond
-"run the Dockerfiles somewhere"), that's stated plainly rather than glossed
-over. See `docs/DECISIONS.md` for the dated reasoning behind each of these
-choices.
+file; where something doesn't exist (a background worker independent of a
+live request, a deploy target beyond "run the Dockerfiles somewhere"),
+that's stated plainly rather than glossed over. See `docs/DECISIONS.md`
+for the dated reasoning behind each of these choices.
 
 ## System diagram
 
@@ -20,7 +20,7 @@ flowchart TB
         Controllers["5 controllers:<br/>documents · chat · meta/health · meta/ai · usage"]
         Retrieval["RetrievalService<br/>query rewrite → embed → RPC → pack context"]
         ChatSvc["ChatService<br/>orchestrates a turn, streams SSE"]
-        Queue["IndexingQueue<br/>in-memory p-queue, concurrency 2<br/>NOT persisted — lost on process restart"]
+        Queue["IndexingQueue<br/>local p-queue (concurrency 2) over a durable claim<br/>backed by document_indexing_jobs (Postgres) — D9.14"]
         IndexSvc["IndexingService<br/>chunk → embed → write chunks"]
         AiMod["AiModule<br/>createAi() — one ChatModel + EmbeddingModel"]
     end
@@ -31,9 +31,10 @@ flowchart TB
     end
 
     subgraph "Postgres (Supabase-hosted or local supabase start)"
-        DB[("documents · document_chunks (pgvector)<br/>conversations · messages · ai_usage_events<br/>Row-Level Security on every table")]
+        DB[("documents · document_chunks (pgvector)<br/>conversations · messages · ai_usage_events<br/>document_indexing_jobs · Row-Level Security on every table")]
         RPC1["match_document_chunks()<br/>hybrid semantic+keyword, RRF fusion"]
         RPC2["replace_document_chunks()<br/>content_hash-guarded atomic swap"]
+        RPC3["claim_indexing_jobs()<br/>for update skip locked — atomic, multi-replica-safe"]
     end
 
     AIExt["External AI provider<br/>OpenAI-compatible /chat/completions + /embeddings<br/>(openai · groq · together · openrouter · ollama · custom · mock)"]
@@ -41,10 +42,12 @@ flowchart TB
     Web -- "Bearer JWT, HTTPS" --> Guard
     Guard --> Controllers
     Controllers -- "enqueue (fire-and-forget)" --> Queue
+    Queue -- "claim, RLS-scoped to the calling request's own JWT" --> RPC3
+    RPC3 --> DB
     Queue --> IndexSvc
     IndexSvc --> RagCore
     IndexSvc -- "embed()" --> AiMod
-    IndexSvc -- "RLS-scoped client, per job's own JWT" --> RPC2
+    IndexSvc -- "same claiming client" --> RPC2
     RPC2 --> DB
 
     Controllers -- "chat turn" --> ChatSvc
@@ -60,11 +63,12 @@ flowchart TB
     ChatSvc -. "SSE: start, sources, delta*, citation*, done" .-> Web
 ```
 
-Two things the diagram compresses that matter: `IndexingQueue` lives
-**inside** the same `apps/api` process that serves HTTP requests — there is
-no separate worker process — and every arrow into Postgres from `apps/api`
-carries the *calling user's own JWT*, not a shared admin credential. Both
-are expanded below.
+Two things the diagram compresses that matter: `IndexingQueue`'s *local*
+concurrency limiter lives **inside** the same `apps/api` process that
+serves HTTP requests — there is no separate worker process — while the
+durable job state it claims from lives in Postgres, not in that process;
+and every arrow into Postgres from `apps/api` carries the *calling user's
+own JWT*, not a shared admin credential. Both are expanded below.
 
 ## Components
 
@@ -95,18 +99,24 @@ server-side.
 3. Only if the content hash actually changed does `DocumentsService` call
    `IndexingQueue.enqueue({ documentId, contentHash, userJwt })` —
    fire-and-forget, not awaited by the HTTP response.
-4. `IndexingQueue` (`apps/api/src/indexing/indexing.queue.ts`) is a `p-queue`
-   with **concurrency 2**, entirely in-memory. Per document it keeps only
-   the *latest* enqueued job — if a document is saved again while its
-   previous job is still queued, the older job is simply replaced, not run
-   twice. Nothing here is persisted to disk or an external broker; a
-   process restart loses every job still sitting in the queue.
-5. `IndexingService.process(job)` rebuilds a Postgres client scoped to the
-   **job's own captured JWT** (not whoever happens to be logged in when the
-   job finally runs), marks the document `indexing`, and calls the real
-   pipeline: `chunkDocument()` (`@kb/rag-core`, defaults 450 target /
-   600 max / 60 overlap tokens) → `embeddingModel.embed()` (`@kb/ai`) →
-   the `replace_document_chunks` RPC.
+4. Updated (D9.14): `enqueue()` first durably **upserts** a row into
+   `document_indexing_jobs` (`supabase/migrations/*_document_indexing_jobs.sql`),
+   keyed by `document_id` — a document saved again while it already has a
+   job outstanding replaces that row rather than queuing a second one, the
+   same "latest job wins" guarantee as before, now surviving a process
+   restart instead of living only in memory. It then best-effort kicks a
+   local claim attempt: `IndexingQueue`'s own `p-queue` (**concurrency 2**,
+   unchanged from Phase 4) bounds how much of *this* work this one process
+   does at once, but the actual claim — `claim_indexing_jobs`, `for update
+   skip locked` — is what's authoritative and multi-replica-safe; a second
+   `apps/api` replica racing to claim the same row simply gets nothing back.
+5. `IndexingService.process(db, job)` takes the **already-scoped client the
+   claim itself ran as** (the request that triggered the claim's own live
+   JWT — never a JWT read back out of storage; see `docs/DECISIONS.md`
+   D9.14 for why one was never persisted in the first place), marks the
+   document `indexing`, and calls the real pipeline: `chunkDocument()`
+   (`@kb/rag-core`, defaults 450 target / 600 max / 60 overlap tokens) →
+   `embeddingModel.embed()` (`@kb/ai`) → the `replace_document_chunks` RPC.
 6. `replace_document_chunks` is the correctness guard: it row-locks the
    document, compares the caller-supplied `content_hash` against the
    document's *current* one, and silently declines (returns `false`, not an
@@ -170,10 +180,11 @@ conventionally avoided. Either path additionally rejects any token whose
 token can't be used to call the API as if it were a user.
 
 Once verified, the guard builds a Postgres client scoped to *that exact
-JWT* and attaches it to the request. Every repository in the app — including
-the asynchronous indexing job processor, which captures the JWT at enqueue
-time and rebuilds a freshly-scoped client from it when the job actually
-runs — takes this per-request client as a parameter. **There is no
+JWT* and attaches it to the request. Every repository in the app —
+including the indexing pipeline, which always runs as whichever live
+request's client actually performed the claim (D9.14; never a stored
+credential — `document_indexing_jobs` holds no JWT/credential column at
+all) — takes this per-request client as a parameter. **There is no
 service-role client anywhere in `apps/api`**, enforced by both code review
 and a standing regression test (`apps/api/src/no-service-role-key.spec.ts`).
 Every table's Row-Level Security policy compares `user_id` against
@@ -182,19 +193,29 @@ an application-level one that a controller bug could bypass.
 
 ## Background and asynchronous work
 
-- **`IndexingQueue`** — covered above. In-process, in-memory, no
-  persistence, no external broker. This is the single biggest structural
-  constraint on how this app can scale; see `docs/SCALING.md`.
-- **Crash recovery, but no boot-time sweep.** Because every query runs
+- **`IndexingQueue`** — covered above. Updated (D9.14): the durable job
+  state (`document_indexing_jobs`) lives in Postgres, not in this process,
+  and claiming it (`claim_indexing_jobs`) is atomic and multi-replica-safe.
+  What's still in-process is only a *local* concurrency limiter (`p-queue`,
+  concurrency 2) over however many of the caller's own claimed jobs this
+  one process works on at a time — not a correctness assumption anymore,
+  just a per-replica throughput cap. See `docs/SCALING.md` item 1.
+- **Crash recovery, but still no boot-time sweep.** Because every query runs
   under RLS as a specific user's JWT, there's no way to run a global
   "resume every stuck job" sweep at process startup — there's no user
   context to run it as, and using a service-role client to bypass that was
   deliberately rejected (same reasoning as the auth boundary above). Instead,
   `DocumentsService` runs this sweep lazily and scoped to the caller, on
-  every `GET /documents`/`GET /documents/:id` call: it looks for that
-  user's own documents stuck in `pending`/`indexing` and re-enqueues them
-  with the user's current JWT. The documented gap: a document whose owner
-  never makes another request stays stuck until they do.
+  every `GET /documents`/`GET /documents/:id` call: it calls
+  `IndexingQueue.kick(auth.db, 2)`, which claims (from the durable table,
+  not by re-deriving stuck-ness from `documents.index_status` the way it
+  used to) up to 2 of that user's own pending or stale-`processing` jobs
+  and processes them with the caller's own current JWT. The documented gap
+  is unchanged by D9.14 and can't structurally be closed without a
+  service-role client: a document whose owner never makes another request
+  stays stuck until they do — what D9.14 fixes is that the job is
+  guaranteed to still be there, correctly claimable, and that two replicas
+  can no longer both grab it. See `docs/DECISIONS.md` D9.14.
 - **No cron, no scheduled jobs, anywhere.** Confirmed by grep — no
   `@Cron`/`@Interval`/`ScheduleModule` usage in `apps/api`, no external
   scheduler config in the repo. The only recurring timer in the whole
@@ -241,15 +262,17 @@ its Dockerfile's image runs), `apps/web` via `next build`'s standalone
 output (`node server.js`, what its Dockerfile's image runs) — and now
 there's a documented, buildable way to package each one, but still nothing
 that automates actually deploying either image anywhere. If this were
-deployed today, the minimum set of running pieces would be: one
-long-running `apps/api` container/process (which also owns the in-memory
-indexing queue — it must be the *same* process instance that receives
-document-save requests, since no separate worker exists, so this remains a
-single-replica constraint even with a real image to run), one long-running
-`apps/web` container/process, and a reachable Postgres+pgvector instance
-with Supabase Auth in front of it (a hosted Supabase project — nothing here
-packages or deploys Postgres itself). There is still no queue worker, no
-cron runner, and no secrets-management system beyond environment
-variables passed to each container directly (a real deployment's own
-mechanism — platform env vars, a secrets manager — not something this repo
-provides); that remains genuinely unaddressed, not merely undocumented.
+deployed today, the minimum set of running pieces would be: one or more
+`apps/api` containers/processes (updated, D9.14: running more than one is
+no longer a correctness hazard — `document_indexing_jobs` and
+`claim_indexing_jobs` make indexing safe across replicas, see
+`docs/DECISIONS.md` D9.14 and `docs/SCALING.md` item 1 — though there is
+still no orchestrator config here that actually runs more than one), one
+long-running `apps/web` container/process, and a reachable Postgres
++pgvector instance with Supabase Auth in front of it (a hosted Supabase
+project — nothing here packages or deploys Postgres itself). There is
+still no background worker independent of a live request, no cron runner,
+and no secrets-management system beyond environment variables passed to
+each container directly (a real deployment's own mechanism — platform env
+vars, a secrets manager — not something this repo provides); that remains
+genuinely unaddressed, not merely undocumented.

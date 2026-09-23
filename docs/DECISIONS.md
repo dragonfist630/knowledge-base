@@ -3269,3 +3269,224 @@ documentation rather than recalled from training; it could not be run
 end-to-end in this sandbox (that would require actually pushing to
 GitHub and watching Actions execute), which is stated here rather than
 implied to have been fully proven.
+
+### D9.14 — A persisted indexing queue, replacing the in-memory one `docs/SCALING.md` item 1 named as the real remaining blocker
+
+`docs/SCALING.md` item 1 (rewritten in D9.13 once packaging stopped being
+the first blocker) named the actual remaining one plainly: `IndexingQueue`
+was an in-memory `p-queue` living inside the request-serving process — a
+restart silently dropped every queued job, and a second `apps/api` replica
+would duplicate embedding work rather than coordinate with the first. This
+entry replaces it with `document_indexing_jobs`, a durable, RLS-scoped
+Postgres table, and rebuilds `IndexingQueue`/`IndexingService` on top of
+it.
+
+**pg-boss was the obvious first candidate, and was rejected before writing
+any code.** It runs on the same Postgres already in use (no new infra) and
+is the standard answer to "durable Postgres-backed job queue" — but it
+needs a direct `DATABASE_URL` connection with schema-creation rights.
+Checked before assuming otherwise: `apps/api/package.json` has no
+`pg`/`pg-boss` dependency, `apps/api/src/config/env.ts` has no
+`DATABASE_URL`, and `apps/api/src/auth/supabase-client.factory.ts` shows
+every single query this app makes goes through Supabase's PostgREST layer
+under the calling user's own JWT — RLS is the *only* authorization
+boundary anywhere in `apps/api`, and D3.6 exists specifically because a
+forged/leaked elevated credential is dangerous. A `DATABASE_URL` with
+schema rights is exactly that kind of credential, and pg-boss's own schema
+(`pgboss.job`, etc.) would sit entirely outside RLS regardless. Surfaced
+to the user rather than either silently proceeding with pg-boss or
+silently picking something else — the user chose a custom table over
+"pg-boss anyway, with a tightly scoped DB role," which would still add a
+second credential class this app has never had.
+
+**The design.** `supabase/migrations/20260923083633_document_indexing_jobs.sql`
+adds one table, RLS-scoped exactly like every other table in this schema
+(the same `(select auth.uid()) = user_id` policy quadruple `documents`
+uses), plus one RPC:
+
+- `document_indexing_jobs.document_id` is the table's **primary key**, not
+  a generated id — deliberately not an append-only log. A document has at
+  most one outstanding job at a time, and enqueuing a job for a document
+  that already has one pending replaces it rather than queuing a second
+  row. A plain `.upsert(..., { onConflict: "document_id" })` gets "latest
+  job wins" for free — the exact same semantics the old in-memory queue's
+  `pendingByDocument` Map gave, now durable across a restart instead of
+  living in process memory.
+- `claim_indexing_jobs(p_limit, p_stale_after)` atomically claims up to
+  `p_limit` of the CALLING user's own `'pending'` jobs, or `'processing'`
+  jobs whose `locked_at` is older than `p_stale_after` (a worker that
+  claimed a job and then crashed mid-job) — flipping each to
+  `'processing'`, stamping `locked_at = now()`, and incrementing
+  `attempts`, all in one `security invoker` SQL statement using `for
+  update skip locked` (the standard Postgres job-queue-claiming pattern),
+  mirroring `replace_document_chunks`'s existing `security invoker` +
+  explicit `user_id = (select auth.uid())` filter style. RLS means this
+  can only ever claim the caller's own rows regardless of what the SQL
+  looks like; the explicit filter is redundant with that (kept anyway, for
+  the same query-planner reason the retrieval RPCs keep theirs — proven
+  redundant-but-load-bearing below, not just asserted).
+- Completion is a plain `delete ... where document_id = ? and content_hash
+  = ?` (success) or `update ... set status = 'failed', error = ? where
+  document_id = ? and content_hash = ?` (failure) — both guarded by
+  `content_hash`, the exact same principle `replace_document_chunks` and
+  the old `markFailed`/`markIndexing` already used on `documents` itself:
+  a job finishing work on an OLD version of a document, after a newer edit
+  already upserted a fresh `'pending'` row for the new content_hash, must
+  not delete or fail that newer row out from under it. A 0-row write here
+  is a silent, expected no-op in exactly that race.
+
+**The `user_jwt` column that didn't ship.** The design sketch going into
+this (see the summary this session continued from) planned a `user_jwt`
+column, reasoning that a job might be claimed and processed by a request
+other than the one that enqueued it, and every Postgres access here has to
+run as some real user's own JWT. Working through the actual call sites
+*before* writing the migration showed that reasoning doesn't hold up:
+there are exactly two places anything ever claims a job —
+`IndexingQueue.enqueue()`'s own immediate follow-up claim attempt (using
+the JWT that request just authenticated with) and
+`documents.service.ts`'s `resumeStuckIndexing` sweep (using whatever
+*later* request happens to trigger it, via `auth.db`) — and
+`claim_indexing_jobs` itself only ever returns the calling user's own rows
+under RLS, so "whoever successfully claimed a row" and "whose JWT would be
+needed to process it" are always the same live request. Nothing ever
+reads a stored JWT back out. Storing one anyway would have been pure
+unused credential-at-rest exposure — worse than the "store it but null it
+on completion" mitigation the original sketch planned, since nulling only
+bounds an exposure that turned out to be unnecessary in the first place.
+The column was dropped before the migration was ever run, not shipped and
+walked back later.
+
+**What changed, beyond the migration.** `IndexingRepository` gained
+`enqueueJob`/`claimJobs`/`completeJob`/`failJob`. `IndexingQueue` no
+longer holds any durable state itself (`pendingByDocument`/`active` are
+gone) — it now wraps a small `p-queue` (concurrency 2, unchanged) purely
+as a *local* concurrency limiter over `claimAndProcessOne()`, which claims
+one job via a caller-supplied, already-scoped `SupabaseClient` and hands
+it to `IndexingService.process(db, job)` (now takes the claiming client
+directly, rather than rebuilding one from a job-carried JWT).
+`enqueue(job)` keeps its exact old public signature (documents.service.ts
+needed zero call-site changes at create/update/reindex) but now durably
+upserts first, then best-effort kicks a local claim attempt using a client
+built from the JWT that call was given. After a job finishes (success or
+failure), `claimAndProcessOne` kicks itself again with the same
+still-valid client — self-chaining to pick up a job a racing edit may have
+upserted mid-processing, the same way the old queue's inner loop drained
+`pendingByDocument` before releasing its `p-queue` slot, just now backed
+by a real claim instead of an in-memory Map read.
+
+`documents.service.ts`'s `resumeStuckIndexing` changed from querying
+`documents.index_status` directly (`findStuckIndexing`, now deleted — it
+has no callers left) to calling `indexingQueue.kick(auth.db, 2)` — the job
+table, not `documents.index_status`, is now the source of truth for
+"is there indexing work outstanding." This is still not, and structurally
+cannot be, a boot-time or timer-driven sweep: at boot, or on a bare timer,
+there is no request and therefore no real user JWT to run any query as,
+and the only way around that would be a service-role client, which this
+app still has nowhere (D3.6). So crash recovery still only ever happens
+request-adjacent, exactly as before D9.14 — a document whose owner never
+makes another request after a crash stays stuck until they do. What D9.14
+actually fixes is everything *else* about that story: the job now
+survives the crash itself (it's a Postgres row, not a Node Map), and
+whichever later request eventually does trigger the sweep — even from a
+completely different `apps/api` replica — claims it atomically, so two
+replicas processing the same stuck document twice is no longer possible.
+
+**Multi-replica duplicate work, specifically.** The other half of
+`docs/SCALING.md` item 1 — "two replicas would each have their own
+independent queue and could process the same document concurrently" — is
+closed by `for update skip locked` itself: whichever replica's claim call
+commits first gets the row; every other concurrent claim (same replica or
+a different one) simply skips it and returns nothing. Verified live, not
+just reasoned about (below).
+
+**Verification.**
+
+*The migration, live, against a real Postgres.* Applied
+`apps/api/test/e2e/bootstrap.sql`'s auth shim (the same one Gate 3's own
+e2e harness uses) plus all four migrations, in order, to a scratch
+database — clean apply, no errors. Then, by hand:
+
+- Upsert-by-`document_id` semantics: enqueuing twice for the same document
+  leaves exactly one row, with the second call's `content_hash`.
+- RLS: user B sees 0 rows of user A's jobs; user B's insert against A's
+  document fails `42501` (the insert policy's join against `documents`,
+  not just the bare `user_id` check); user B's own `claim_indexing_jobs`
+  call returns nothing even while A has a genuinely pending job.
+- **Real concurrency**, not simulated: two actual separate `psql`
+  processes, each in its own transaction, both calling
+  `claim_indexing_jobs(2)` against the same 3-row pending pool, the first
+  holding its transaction open for 2 seconds before committing. Session A
+  (started first) claimed 2 rows; session B (started 0.3s later) correctly
+  skipped A's locked rows and claimed only the 1 remaining row — disjoint
+  results, no blocking, no double-claim. This is the actual mechanism
+  `docs/SCALING.md` item 1's "would be doing the embedding work twice"
+  concern depended on, proven under real concurrent transactions rather
+  than asserted from the SQL alone.
+- Staleness: an immediate re-claim after all jobs are `'processing'`
+  returns 0 rows; back-dating one job's `locked_at` to 10 minutes ago (past
+  the 5-minute default) makes it — and only it — claimable again, with
+  `attempts` incremented.
+- Terminal-state cleanup: delete-on-success and update-to-`'failed'`-on
+  -failure both work as plain guarded writes; deleting the parent
+  `documents` row cascades to delete its job row automatically (a bonus
+  invariant from the FK, not something the application code has to
+  remember to do itself).
+
+*pgTAP, non-vacuously.* New `supabase/tests/document_indexing_jobs.test.sql`,
+12 assertions covering the same ground as the manual verification above
+(minus true cross-session concurrency, which a single-transaction pgTAP
+run structurally can't exercise — that's what the manual two-session test
+above is for instead, and this file says so in its own header). Proven
+non-vacuous, not just "written and green": re-ran the suite against a
+scratch database with RLS disabled on the table (2 of 12 assertions
+correctly flipped to `not ok` — the RLS-isolation ones — while the
+`claim_indexing_jobs`-scoped-by-its-own-explicit-filter assertion stayed
+green, confirming that redundant filter really is doing independent work,
+not just restating what RLS already guarantees), and again with the
+staleness branch removed from `claim_indexing_jobs` (1 assertion correctly
+flipped — the stale-reclaim one, everything else unaffected). Both breaks
+restored before moving on.
+
+*The full stack, real e2e.* `apps/api/src/indexing/indexing.service.spec.ts`
+updated for the new `process(db, job)` signature and the two new
+repository calls, plus a new case covering the content_hash-mismatch
+early-return explicitly. `apps/api/test/indexing.e2e-spec.ts` gained two
+new cases against the real Postgres+PostgREST+RLS stack (same harness as
+every other Gate 3 test), each bypassing `documents.service.ts`'s normal
+`create()`/`enqueue()` path entirely — writing a `documents` row and a
+`document_indexing_jobs` row directly via a real user-scoped Supabase
+client, exactly the state a process crash a split second after committing
+its own enqueue (or after claiming but before finishing) would leave
+behind — then asserting nothing except an unrelated later `GET
+/documents/:id` call is what gets the document to `'ready'`:
+
+1. A job left `'pending'` with no local worker ever having touched it —
+   recovered by a later request's `resumeStuckIndexing` sweep.
+2. A job stuck `'processing'` with `locked_at` an hour in the past
+   (simulating a worker that claimed it and then died mid-job) — reclaimed
+   and completed the same way.
+
+Both proven non-vacuous the same way this project has proven every
+regression test non-vacuous since Phase 4: temporarily disabled
+`resumeStuckIndexing` (replaced its body with a no-op) and re-ran — both
+new cases failed (one hit the suite's own rate limiter after enough failed
+polls, rather than a clean timeout, because `waitFor`'s 50ms poll interval
+has no independent cap; still a failure, still proof the assertion isn't
+vacuously true), confirming the fix, not the test's plumbing, is what
+makes them pass. Reverted before re-running for real.
+
+Final state: `pnpm typecheck`/`pnpm lint`/`pnpm test` all clean across
+every workspace (66 apps/api unit tests, up from 65), and the full Gate 3
+e2e suite green at 30/30 (up from 28 — the two new cases above), all
+against a real Postgres + PostgREST + RLS stack, not mocks.
+
+`docs/SCALING.md` item 1 is updated to describe this: multi-replica
+duplicate work and restart-survival are both actually fixed now, and the
+one thing that remains genuinely unbuilt — a true, decoupled,
+always-on background worker, independent of any live request — is stated
+as structurally blocked by this app's own RLS-only invariant (D3.6), not
+as a "nice to have that ran out of time." Building one for real would mean
+either a service-role client (reopening exactly the risk D3.6 was written
+to avoid) or a scheduled external trigger that authenticates as some
+specific user on a timer (a different, and differently-scoped, feature
+than "a background worker").

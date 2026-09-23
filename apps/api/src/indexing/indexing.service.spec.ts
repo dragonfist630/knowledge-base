@@ -1,16 +1,23 @@
 import { describe, expect, it, vi } from "vitest";
 import type { EmbeddingModel } from "@kb/ai";
+import type { Database } from "@kb/shared";
+import type { SupabaseClient } from "@supabase/supabase-js";
 
 import type { ApiEnv } from "../config/env.js";
 // IndexingQueue/IndexingRepository are type-only here — unlike
 // indexing.service.ts itself, this file never goes through Nest's DI
 // container (IndexingService is constructed directly, below), so there's
 // no design:paramtypes concern (see D3.3) to keep these as value imports.
-import type { IndexingJob, IndexingQueue } from "./indexing.queue.js";
-import type { IndexingRepository } from "./indexing.repository.js";
+import type { IndexingQueue } from "./indexing.queue.js";
+import type { ClaimedIndexingJob, IndexingRepository } from "./indexing.repository.js";
 import { IndexingService } from "./indexing.service.js";
 
-const JOB: IndexingJob = { documentId: "doc-1", contentHash: "hash-1", userJwt: "fake.jwt.token" };
+const JOB: ClaimedIndexingJob = { documentId: "doc-1", contentHash: "hash-1", attempts: 1 };
+
+// Opaque as far as this test is concerned — every call IndexingService makes
+// through it goes to the mocked IndexingRepository below, never a real
+// Supabase client. Just needs to be a stable identity to pass through.
+const FAKE_DB = {} as SupabaseClient<Database>;
 
 const FAKE_ENV = {
   RAG_CHUNK_TOKENS: 450,
@@ -42,12 +49,14 @@ function makeRepository(overrides: Partial<Record<keyof IndexingRepository, unkn
     replaceChunks: vi.fn(async () => true),
     markFailed: vi.fn(async () => undefined),
     recordUsage: vi.fn(async () => undefined),
+    completeJob: vi.fn(async () => undefined),
+    failJob: vi.fn(async () => undefined),
     ...overrides,
   } as unknown as IndexingRepository;
 }
 
 function makeQueue(): IndexingQueue {
-  return { setProcessor: vi.fn() } as unknown as IndexingQueue;
+  return { setProcessor: vi.fn(), kick: vi.fn() } as unknown as IndexingQueue;
 }
 
 /**
@@ -67,10 +76,11 @@ describe("IndexingService.process — usage recording must never affect the writ
     });
     const service = new IndexingService(FAKE_ENV, makeEmbeddingModel(), makeQueue(), repository);
 
-    await service.process(JOB);
+    await service.process(FAKE_DB, JOB);
 
     expect(repository.replaceChunks).toHaveBeenCalledTimes(1);
     expect(repository.markFailed).not.toHaveBeenCalled();
+    expect(repository.completeJob).toHaveBeenCalledTimes(1);
   });
 
   it("records usage AFTER replaceChunks, not before", async () => {
@@ -86,7 +96,7 @@ describe("IndexingService.process — usage recording must never affect the writ
     });
     const service = new IndexingService(FAKE_ENV, makeEmbeddingModel(), makeQueue(), repository);
 
-    await service.process(JOB);
+    await service.process(FAKE_DB, JOB);
 
     expect(order).toEqual(["replaceChunks", "recordUsage"]);
   });
@@ -95,13 +105,17 @@ describe("IndexingService.process — usage recording must never affect the writ
     const repository = makeRepository({ replaceChunks: vi.fn(async () => false) });
     const service = new IndexingService(FAKE_ENV, makeEmbeddingModel(), makeQueue(), repository);
 
-    await service.process(JOB);
+    await service.process(FAKE_DB, JOB);
 
     expect(repository.recordUsage).toHaveBeenCalledTimes(1);
     expect(repository.markFailed).not.toHaveBeenCalled();
+    // completeJob is still called (content_hash-guarded, so it's a safe
+    // no-op against the DB in the real superseded case) — see
+    // indexing.service.ts's own comment on why.
+    expect(repository.completeJob).toHaveBeenCalledTimes(1);
   });
 
-  it("a genuine embed() failure still marks the document failed (recordUsage is never reached)", async () => {
+  it("a genuine embed() failure still marks the document failed (recordUsage is never reached), and marks the job row failed too", async () => {
     const repository = makeRepository();
     const failingEmbeddingModel: EmbeddingModel = {
       descriptor: { provider: "mock", model: "mock-embedding", baseUrl: "mock://local", dimensions: 4 },
@@ -111,10 +125,31 @@ describe("IndexingService.process — usage recording must never affect the writ
     };
     const service = new IndexingService(FAKE_ENV, failingEmbeddingModel, makeQueue(), repository);
 
-    await service.process(JOB);
+    await service.process(FAKE_DB, JOB);
 
     expect(repository.replaceChunks).not.toHaveBeenCalled();
     expect(repository.recordUsage).not.toHaveBeenCalled();
     expect(repository.markFailed).toHaveBeenCalledTimes(1);
+    expect(repository.failJob).toHaveBeenCalledTimes(1);
+    expect(repository.completeJob).not.toHaveBeenCalled();
+  });
+
+  it("a job whose content_hash no longer matches the document's (superseded before processing started) does nothing — no write, no completion, no failure", async () => {
+    const repository = makeRepository({
+      findForIndexing: vi.fn(async () => ({
+        id: "doc-1",
+        title: "T",
+        content: "content",
+        contentHash: "a-newer-hash", // differs from JOB.contentHash
+      })),
+    });
+    const service = new IndexingService(FAKE_ENV, makeEmbeddingModel(), makeQueue(), repository);
+
+    await service.process(FAKE_DB, JOB);
+
+    expect(repository.markIndexing).not.toHaveBeenCalled();
+    expect(repository.replaceChunks).not.toHaveBeenCalled();
+    expect(repository.completeJob).not.toHaveBeenCalled();
+    expect(repository.failJob).not.toHaveBeenCalled();
   });
 });

@@ -87,20 +87,22 @@ registry or shared between environments.
 
 ## Constraints that don't go away just because there's now an image
 
-**Exactly one `apps/api` instance, no more, can run at a time.**
-`IndexingQueue` (the pipeline that turns a saved document into searchable
-chunks) is in-process and in-memory — there is no separate worker, no
-shared queue table, nothing that would let a second replica coordinate
-with the first. Two `apps/api` containers running against the same
-database would each silently believe they alone own the world: a
-document-save request handled by container A enqueues a job only container
-A knows about, and `resumeStuckIndexing`'s crash-recovery sweep only
-re-picks-up whatever each container itself lost track of — see
-`docs/ARCHITECTURE.md` and `docs/SCALING.md` item 7 for the (still
-unbuilt) fix a real multi-replica deployment would need first: a
-persisted job queue, not an in-memory one. A load balancer or orchestrator
-config that scales `apps/api` beyond `replicas: 1` today is not something
-this app is ready for, regardless of what the Docker image itself allows.
+**Running more than one `apps/api` instance is no longer an indexing
+-correctness hazard (D9.14), but nothing here actually runs more than
+one.** `IndexingQueue` used to be in-process and in-memory — two
+containers running against the same database would each silently believe
+they alone owned the world, duplicating embedding work and dropping
+queued jobs on restart. That's fixed: indexing state now lives in the
+durable, RLS-scoped `document_indexing_jobs` table, and jobs are claimed
+atomically (`claim_indexing_jobs`, `for update skip locked`) — two
+replicas racing to claim the same job can no longer both succeed. See
+`docs/ARCHITECTURE.md` and `docs/DECISIONS.md` D9.14 for the full design
+and how it was verified, including under real concurrent transactions.
+What's still true: there's no background worker independent of a live
+request (claiming only happens request-adjacent — right after a save, or
+via `resumeStuckIndexing` on a later read), and no orchestrator config
+anywhere in this repo that would actually run `apps/api` at
+`replicas: 2+` — see `docs/SCALING.md` item 1 for both of those in full.
 
 **Postgres isn't part of either image.** Both expect a reachable, already
 -migrated Supabase project (hosted, or self-hosted separately) — see the
