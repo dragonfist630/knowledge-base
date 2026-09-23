@@ -119,15 +119,25 @@ configured provider takes to respond. This scales with usage roughly
 linearly and isn't something the app's own architecture can improve —
 provider choice (`docs/PROVIDERS.md`), not code, is the lever here.
 
-## 7. No deployment automation exists yet — this is a prerequisite, not a "nice to have," before scaling
+## 7. There's now a way to run one instance of each app — multi-replica scaling still has nothing to exercise it
 
-Stated in `docs/ARCHITECTURE.md` and repeated here because it matters for
-scaling specifically: there's no Dockerfile, no CI, and no deploy config in
-this repo. None of the above scaling levers (multiple `apps/api` replicas,
-a shared rate-limit store, a real job queue) can be exercised until there's
-a way to actually run more than one instance of anything. This is
-deliberately the first thing to build once scaling is a real requirement,
-not an afterthought to bolt on later.
+Updated (D9.13, Phase 9): `apps/api/Dockerfile` and `apps/web/Dockerfile`
+now exist, and `.github/workflows/ci.yml` builds both on every push — see
+`docs/ARCHITECTURE.md`'s "Deployment shape as it exists today" and
+`docs/DEPLOYMENT.md`. That closes "there's no way to even package this,"
+which used to be the literal first blocker here. It does NOT close this
+item's actual scaling concern: `apps/api`'s in-memory `IndexingQueue`
+still means exactly one instance, no more, can safely run at a time (a
+second replica would silently split document-save requests and
+`resumeStuckIndexing` sweeps across two independent, unaware-of-each-other
+queues — see `docs/ARCHITECTURE.md`). None of the scaling levers above
+(multiple `apps/api` replicas, a shared rate-limit store, a real job
+queue) can be exercised until that gets a real fix — a persisted job queue
+(the obvious candidate: a `document_indexing_jobs` table plus a poll loop,
+so any instance can pick up a stuck job, not just the one that enqueued
+it) is still deliberately unbuilt, not merely unautomated. No deploy
+target (a host, a Kubernetes cluster, an autoscaling group) exists to run
+more than one instance on yet either, even if the queue were fixed first.
 
 ## What's already handled well, and doesn't need revisiting for scale
 

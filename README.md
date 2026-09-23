@@ -128,6 +128,7 @@ docs/ARCHITECTURE.md   a real diagram + request flows + auth boundary, sourced f
 docs/API.md            every route apps/api exposes — request/response shapes, error cases
 docs/SCALING.md         an honest bottleneck list for this app as actually built, ranked by severity
 docs/PROVIDERS.md      the full AI provider swap guide (OpenAI, Groq, Together, …)
+docs/DEPLOYMENT.md     how to build/run the Docker images; what CI covers; what still doesn't exist
 docs/AI_WORKFLOW.md    a running log of what was asked of the AI each phase
 ```
 
@@ -198,11 +199,13 @@ running on your machine.
   the most complete and most current source of truth in this repo.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — a real system diagram,
   the two main request flows end to end (save/index, chat/stream), the
-  auth boundary, and what's genuinely not built yet (no Dockerfile, no CI).
+  auth boundary, and the deployment shape as it exists today.
 - [`docs/API.md`](docs/API.md) — every route `apps/api` exposes: auth,
   rate limits, exact request/response shapes, and every real error case.
 - [`docs/SCALING.md`](docs/SCALING.md) — an honest bottleneck list for
   this app as actually implemented, ranked by which one you'd hit first.
 - [`docs/PROVIDERS.md`](docs/PROVIDERS.md) — the AI provider swap guide.
+- [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) — how to build and run the
+  Docker images, required env vars, and what CI checks on every push.
 - [`docs/AI_WORKFLOW.md`](docs/AI_WORKFLOW.md) — a narrative log of what
   was asked of the AI each phase and how mistakes got caught.

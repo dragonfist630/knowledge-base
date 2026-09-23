@@ -1,0 +1,37 @@
+# Applies to every `docker build` in this repo, whichever Dockerfile is
+# used — Docker only reads one .dockerignore, from the build context root
+# (the repo root; both apps/api/Dockerfile and apps/web/Dockerfile are
+# built with `-f apps/<app>/Dockerfile .` for exactly this reason, so
+# `turbo prune`'s COPY . . step inside the pruner stage — see either
+# Dockerfile — sees the whole monorepo). See docs/DECISIONS.md D9.13.
+
+node_modules
+**/node_modules
+**/dist
+**/.next
+**/.next-e2e
+**/.turbo
+**/coverage
+.git
+.cache
+
+# Local env/secrets never belong in an image — real deployments inject
+# config via the platform's env/secrets mechanism (see apps/*/Dockerfile
+# and docs/DEPLOYMENT.md), not a baked-in file.
+.env
+.env.*
+!.env.example
+
+# Editor/OS cruft, docs, and CI config — none of it is needed to build
+# either app, and excluding it keeps the build context (and Docker's
+# hashing of it) small.
+.vscode
+.idea
+*.log
+.DS_Store
+.github
+docs
+
+# Playwright/test artifacts that sometimes land at repo root locally.
+playwright-report
+test-results

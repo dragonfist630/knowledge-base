@@ -12,6 +12,16 @@ const repoRoot = path.resolve(__dirname, "../..");
 loadEnvConfig(repoRoot);
 
 const nextConfig: NextConfig = {
+  // Traces the minimal set of files a production server needs —
+  // including workspace packages like @kb/shared, resolved out of the
+  // pnpm workspace rather than assumed to be there — into
+  // `.next/standalone/` as a self-contained `server.js` plus only the
+  // node_modules it actually touches. Irrelevant to `next dev` (which
+  // never reads this option) and to Gate 6's Playwright harness, which
+  // also runs dev; it's what apps/web/Dockerfile's production image is
+  // built from. See docs/DECISIONS.md D9.13.
+  output: "standalone",
+
   // Next's dev server refuses to start a second instance against the same
   // project directory — even on a different port — because its "another
   // dev server is already running" lock lives in `.next/` and is keyed by

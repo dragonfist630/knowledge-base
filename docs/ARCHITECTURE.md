@@ -2,9 +2,10 @@
 
 A from-the-code description of how this app is actually built, not how a
 generic RAG app might be built. Every claim here is sourced from a specific
-file; where something doesn't exist (a queue worker, a Dockerfile, a CI
-pipeline), that's stated plainly rather than glossed over. See
-`docs/DECISIONS.md` for the dated reasoning behind each of these choices.
+file; where something doesn't exist (a queue worker, a deploy target beyond
+"run the Dockerfiles somewhere"), that's stated plainly rather than glossed
+over. See `docs/DECISIONS.md` for the dated reasoning behind each of these
+choices.
 
 ## System diagram
 
@@ -223,20 +224,32 @@ an application-level one that a controller bug could bypass.
 
 ## Deployment shape as it exists today
 
-Stated plainly rather than implied: **there is no `Dockerfile`, no CI
-workflow (`.github/` doesn't exist), and no deploy config of any kind** in
-this repo — no `vercel.json`, no `fly.toml`, no Kubernetes manifests.
-Turborepo (`turbo.json`) orchestrates local dev/build/lint/test only.
+Updated (D9.13, Phase 9): `apps/api/Dockerfile` and `apps/web/Dockerfile`
+(multi-stage, `turbo prune --docker` based) build a production image for
+each app, and `.github/workflows/ci.yml` runs typecheck/lint/unit tests,
+both e2e suites (Gate 3 against a real Postgres service container, Gate 6
+against real Chromium), and a build of both images on every push/PR to
+`main`. See `docs/DEPLOYMENT.md` for how to actually run the images and
+`docs/DECISIONS.md` D9.13 for what was and wasn't possible to verify live
+before this landed. There is still no `vercel.json`, no `fly.toml`, no
+Kubernetes manifests, and no host this is actually deployed to — the
+images exist and build; nothing runs them anywhere yet.
 
 Both apps are plain, independently runnable Node processes —
-`apps/api` via `nest build && node dist/main` (`npm run start:prod`),
-`apps/web` via `next build && next start` — but nothing in the repo
-packages or automates deploying either one. If this were deployed today
-as-is, the minimum set of running pieces would be: one long-running
-`apps/api` process (which also owns the in-memory indexing queue — it must
-be the *same* process instance that receives document-save requests, since
-no separate worker exists), one long-running `apps/web` process, and a
-reachable Postgres+pgvector instance with Supabase Auth in front of it.
-There is no queue worker, no cron runner, and no secrets-management system
-beyond a single shared root `.env` file — all of that is genuinely
-unaddressed by the current config, not merely undocumented.
+`apps/api` via `nest build && node dist/main` (`npm run start:prod`, what
+its Dockerfile's image runs), `apps/web` via `next build`'s standalone
+output (`node server.js`, what its Dockerfile's image runs) — and now
+there's a documented, buildable way to package each one, but still nothing
+that automates actually deploying either image anywhere. If this were
+deployed today, the minimum set of running pieces would be: one
+long-running `apps/api` container/process (which also owns the in-memory
+indexing queue — it must be the *same* process instance that receives
+document-save requests, since no separate worker exists, so this remains a
+single-replica constraint even with a real image to run), one long-running
+`apps/web` container/process, and a reachable Postgres+pgvector instance
+with Supabase Auth in front of it (a hosted Supabase project — nothing here
+packages or deploys Postgres itself). There is still no queue worker, no
+cron runner, and no secrets-management system beyond environment
+variables passed to each container directly (a real deployment's own
+mechanism — platform env vars, a secrets manager — not something this repo
+provides); that remains genuinely unaddressed, not merely undocumented.

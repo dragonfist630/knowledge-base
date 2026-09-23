@@ -3142,3 +3142,130 @@ the fix and the full suite (28/28) passed again. Full pipeline
 Playwright suite (2/2, including the existing document-editor smoke test,
 which exercises `document-form.tsx`'s save path unchanged) all re-ran
 clean after restoring the fix.
+
+### D9.13 — A Dockerfile for each app and a real CI workflow, closing the last deferred gap
+
+`docs/ARCHITECTURE.md` and `docs/SCALING.md` have both said plainly, since
+Phase 9's audit, that there was no `Dockerfile`, no CI workflow, and no
+deploy config of any kind in this repo, and that `docs/SCALING.md` item 7
+called this "a prerequisite, not a 'nice to have,' before scaling." This
+closes it: a production image for each app, and a GitHub Actions workflow
+that runs the same checks this project has always been verified with by
+hand before every commit in this log.
+
+**The images.** Both `apps/api/Dockerfile` and `apps/web/Dockerfile` use
+`turbo prune <app> --docker` — Vercel's own documented pattern for a
+Turborepo + pnpm monorepo, not something invented here — to build from a
+pruned subset of the workspace (verified by actually running it against
+this repo, not assumed from the docs: `turbo prune api --docker` pulls in
+exactly `@kb/ai`, `@kb/rag-core`, `@kb/shared` plus the dev-only
+`@kb/eslint-config`/`@kb/tsconfig` turbo's graph always includes). Each
+Dockerfile must be built from the repo root (`docker build -f
+apps/api/Dockerfile .`), not its own directory, so the pruner stage's
+`COPY . .` sees the whole workspace — turbo prune needs that to compute
+the pruned subset in the first place.
+
+apps/web's image needed one real code change, not just packaging:
+`next.config.ts` gained `output: "standalone"`, so `next build` traces the
+minimal set of files (including workspace packages, resolved out of the
+pnpm workspace rather than assumed present) a production server needs into
+a self-contained `server.js` — dramatically smaller than shipping the
+whole `node_modules` tree the way apps/api's image does. apps/api has no
+equivalent tracing mechanism for a plain Node service, so its image is
+simpler and less lean by comparison: the runner stage copies the
+installer stage's full (dev+prod) `node_modules` forward rather than
+pruning to a production-only install — a documented, deliberate choice
+(see the Dockerfile's own comment) to avoid `pnpm deploy`'s workspace
+-resolution complexity in the same change as everything else here, not an
+oversight; a real production-only image is a follow-up someone could take
+on independently of anything else in this entry.
+
+apps/web's `NEXT_PUBLIC_*` values have to be Docker build ARGs, not just
+runtime env — Next.js inlines them into the client bundle at `next build`
+time, so a value only set at `docker run` is invisible to code already
+shipped to the browser. Verified this flows correctly through
+`scripts/with-root-env.mjs`'s existing allowlist mechanism (not a new one
+added for this): `root-env.mjs`'s `resolveWebEnv` treats anything already
+in `process.env` as authoritative over the root `.env` file, so a real env
+var set before `next build` runs (a Docker `ARG`/`ENV`, in this case) wins
+regardless of whether a `.env` file exists in the image at all — read the
+actual function rather than assumed.
+
+**What was and wasn't verified live.** Docker Hub is unreachable from the
+sandbox this was built in — an org egress policy denial (`403` from
+`registry-1.docker.io`, confirmed via the proxy status endpoint, not
+retried or routed around per this session's own standing instructions on
+policy denials), so `docker build` itself could never complete here for
+either Dockerfile; `FROM node:22-alpine` can't even resolve. What WAS
+verified, precisely, rather than left as "should work": every `RUN` step
+each Dockerfile actually performs, replicated by hand outside Docker in a
+scratch directory — `npx turbo prune api --docker` (and separately `web`)
+into a real pruned checkout, `pnpm install --frozen-lockfile` against just
+`out/json/` (proving the lockfile really does travel with the json-only
+layer, not just the full source — this matters because it's exactly the
+kind of thing that looks right by inspection and is wrong in practice),
+overlaying `out/full/` and running `pnpm turbo run build --filter=api`
+(and `--filter=web` with the `NEXT_PUBLIC_*` build args set), then
+literally running the resulting output the same way each Dockerfile's
+`CMD` does — `node apps/api/dist/main.js` (curled `/health`, got
+`{"status":"ok"}`) and `node apps/web/server.js` from a directory laid out
+exactly like the runner stage's `COPY`s produce it (curled `/login`, got
+`200`). Both use fake-but-well-formed env values (`SUPABASE_URL`,
+`NEXT_PUBLIC_SUPABASE_URL`, etc. pointed at `localhost` — nothing in
+either boot path or these two routes specifically touches a real Supabase
+project). The only thing this approach can't exercise is the base-image
+layer itself and Docker's own layer-caching behavior — a risk judged low
+for a standard official Node image doing nothing unusual, but stated
+plainly rather than glossed over, same as this project states every other
+gap. `.github/workflows/ci.yml`'s new `docker-build` job (below) is what
+closes this specific gap going forward, on a runner that actually has
+normal registry access.
+
+**The CI workflow.** `.github/workflows/ci.yml`, four jobs, on every
+push/PR to `main`: `checks` (typecheck, lint, `pnpm test` — no external
+services, since turbo.json's `dependsOn: ["^build"]` on each of those
+tasks already builds every workspace package they need); `e2e-api` (Gate
+3 — apps/api/test/e2e/global-setup.ts's existing Docker-free harness,
+D3.1, pointed at a real `postgres:16` service container instead of a
+laptop's local Postgres — the harness itself needed zero changes, since it
+was already designed to work against "a running Postgres reachable as a
+superuser," which is exactly what a GitHub Actions service container is);
+`e2e-web` (Gate 6 — same Postgres service, plus `playwright install
+--with-deps chromium`, plus building apps/api first since Gate 6's
+`playwright.config.ts` starts it via `node dist/main.js`, not `next dev`
+the way apps/web itself runs there); `docker-build` (builds both images
+with `docker/build-push-action@v6`, `push: false` — the verification this
+sandbox couldn't do itself, see above). The PostgREST binary each e2e job
+needs (`scripts/e2e-fetch-postgrest.mjs`, already existing, unmodified) is
+cached across runs by its pinned version string rather than re-downloaded
+every time.
+
+**Docs kept honest.** `docs/ARCHITECTURE.md`'s "Deployment shape as it
+exists today" and `docs/SCALING.md` item 7 both explicitly said "no
+Dockerfile, no CI" — both updated to describe what exists now and, just as
+important, what still doesn't: no deploy target (a host, a cluster, an
+autoscaling group) exists to actually run either image on, and
+`apps/api`'s in-memory `IndexingQueue` still limits it to exactly one
+running instance regardless of how many container replicas a deploy
+config might ask for — packaging the app didn't fix that constraint, and
+this entry is explicit that it didn't try to. New `docs/DEPLOYMENT.md`
+covers the actual build/run commands, the required env surface (cross
+-checked against `.env.example` and `src/config/env.ts` rather than
+re-derived from memory), and restates the single-instance constraint
+`docs/SCALING.md` describes in more detail. README.md's file-tree comment
+block and "Further reading" section both gained the new doc and lost their
+own stale "no Dockerfile, no CI" line.
+
+Verified: full pipeline (typecheck, lint, 65 unit tests) and the full
+Gate 3 (28/28) and Gate 6 (2/2) e2e suites all re-ran clean after the
+`next.config.ts` change (the one piece of application code this entry
+touches) — `output: "standalone"` is a build-output option only; it has no
+effect on `next dev`, which is what every other check in this project
+already runs against. `.github/workflows/ci.yml` itself was validated as
+well-formed YAML (`python3 -c "import yaml; yaml.safe_load(...)"`) and
+built from patterns (service containers, `pnpm/action-setup`,
+`docker/build-push-action`) matched against their own current
+documentation rather than recalled from training; it could not be run
+end-to-end in this sandbox (that would require actually pushing to
+GitHub and watching Actions execute), which is stated here rather than
+implied to have been fully proven.
