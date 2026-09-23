@@ -2641,3 +2641,36 @@ All four are now fixed in `docs/API.md`. No changes were needed in
 `docs/ARCHITECTURE.md` or `docs/SCALING.md`. Full pipeline
 (lint/typecheck/test/build) re-confirmed green after the corrections —
 docs-only, no application code touched by this validation pass either.
+### D9.3 — One more full adversarial re-audit: methodology
+
+Asked to do one more full pass across the whole repo — code and docs —
+before calling it truly final, on the theory that every previous audit in
+this project (Phases 0-9) was itself scoped to a particular area, and
+nothing had yet looked at the whole thing at once with fresh eyes.
+
+Dispatched 4 independent subagents in parallel, each told explicitly to
+hunt for **new** bugs not already recorded in this file, to treat the
+task as read-only investigation (no file edits), and to report file+line
+evidence, a concrete failure scenario, and a severity for anything found:
+
+1. Security/auth, scoped to `apps/api` (guards, auth, rate limiting,
+   logging, request handling).
+2. Retrieval/indexing/chat correctness, scoped to `packages/rag-core` and
+   `apps/api`'s retrieval/chat/indexing modules.
+3. Frontend/UX, scoped to `apps/web`.
+4. Docs-vs-code accuracy, scoped to everything under `docs/`.
+
+Consistent with this project's standing rule, none of the 4 reports were
+trusted at face value — an agent's "found a bug" is a hypothesis, not a
+fact. Every finding below was independently re-verified by reading the
+real source myself, and every fix was proven against a live reproduction
+(the bug demonstrated first, then shown fixed) rather than assumed correct
+from reading the diff. Two findings turned out to need real investigation
+before a fix decision could even be made (D9.5's rate-limit bypass needed
+tracing `@nestjs/throttler`'s actual guard-chain semantics; D9.7's
+router-desync needed two rejected fix attempts, each independently
+verified with its own reproduction, before concluding it should be
+deferred). One reported "bug" (a claimed race in `useConversation`'s
+query key) did not reproduce and was dropped — TanStack Query's own
+query-key-based cache dedup already serializes those reads correctly.
+
