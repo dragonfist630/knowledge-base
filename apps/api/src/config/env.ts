@@ -67,6 +67,11 @@ const EnvSchema = z.object({
   THROTTLE_CHAT_TTL_MS: z.preprocess(emptyToUndefined, z.coerce.number().int().positive().optional()).default(
     60_000,
   ),
+  /** Per-IP ceiling checked before auth even runs (PreAuthThrottlerGuard) — see its own doc comment for why this exists as a separate bucket. */
+  THROTTLE_PREAUTH_LIMIT: z.preprocess(emptyToUndefined, z.coerce.number().int().positive().optional()).default(60),
+  THROTTLE_PREAUTH_TTL_MS: z.preprocess(emptyToUndefined, z.coerce.number().int().positive().optional()).default(
+    60_000,
+  ),
 });
 
 export type ApiEnv = z.infer<typeof EnvSchema>;

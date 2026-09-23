@@ -2721,3 +2721,57 @@ unfixed `gpt-tokenizer` characteristic rather than a chunker bug. Both
 bugs have non-vacuous regression tests in `chunker.spec.ts` (proven to
 fail against the pre-fix code, pass against the fix); full suite 45/45.
 
+### D9.5 — `apps/api`: 3 real bugs fixed, 2 deliberately deferred
+
+Agent 1's security/auth pass surfaced three real, independently-verified
+issues:
+
+1. **High: unauthenticated requests bypassed rate limiting entirely.**
+   `AuthGuard` and `UserThrottlerGuard` were both registered as
+   `APP_GUARD` providers, run in array order; when `AuthGuard` throws
+   `UnauthorizedException` (missing/garbage bearer token), Nest's guard
+   chain stops there — `UserThrottlerGuard.canActivate` never runs, so an
+   unbounded flood of requests with no valid token was never counted
+   against any bucket, even though each one is real, billable work
+   (`AuthGuard`'s token check round-trips to Supabase's auth/JWKS
+   endpoint before it can even reject). Fixed with a new
+   `PreAuthThrottlerGuard` (`apps/api/src/common/preauth-throttler.guard.ts`,
+   new file) tracking a separate, IP-keyed `"preauth"` bucket
+   (`THROTTLE_PREAUTH_LIMIT`/`THROTTLE_PREAUTH_TTL_MS`, default 60/60s —
+   generous, so it only ever engages at flood volume), registered as the
+   *first* `APP_GUARD` in `app.module.ts` (line 85), ahead of `AuthGuard`.
+   3 unit tests, one of which was proven non-vacuous by temporarily
+   removing the guard's `onModuleInit` bucket filter and confirming that
+   specific test fails.
+2. **High: bearer tokens and session cookies were logged in full.**
+   `pino-http`'s default `req`/`res` serializers copy headers verbatim
+   into every request log line, including `Authorization` and `Cookie`.
+   Fixed with a `redact` config on `pinoHttp` (`app.module.ts` line ~44:
+   `req.headers.authorization`, `req.headers.cookie`,
+   `res.headers['set-cookie']`, censored). Verified with a live pino-http
+   test showing the token present in log output before the fix and absent
+   after.
+3. **Medium: oversized request bodies produced a raw, off-contract error.**
+   Nest's default body-parser limit is Express's own default (100kb), and
+   a body-parser rejection (413) bypasses Nest's guard/pipe/filter chain
+   entirely, so it never got the app's standard
+   `{requestId, code, message}` error envelope. Fixed in `main.ts`:
+   `NestFactory.create` now passes `bodyParser: false`, followed by
+   explicit `app.useBodyParser("json"/"urlencoded", { limit: "2mb" })`
+   calls and a new Express 4-arg error-handling middleware
+   (`apps/api/src/common/body-parser-error.middleware.ts`) that maps
+   413/415/other body-parser errors onto the standard envelope.
+
+Two further findings were investigated and **deliberately not fixed**
+this pass, following the same precedent as D8.2's keyword-floor decision
+— both require a change bigger than a safe, local patch:
+
+- `retrieval.repository.ts`'s `findContentByIds` has a TOCTOU race: it
+  selects `content` with no `content_hash` check, so a chunk retrieved
+  for one query can be stale if the source document was re-saved and
+  re-indexed between the vector search and this fetch. A real fix needs a
+  content-hash check added to the `match_document_chunks` SQL RPC itself.
+- `documents.service.ts`'s `update()` does a read-then-write with no
+  optimistic-concurrency check — a real fix needs an API contract change
+  (an `If-Match`/version field clients would have to start sending).
+
