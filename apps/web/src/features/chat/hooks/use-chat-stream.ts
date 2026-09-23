@@ -125,11 +125,36 @@ export function useChatStream(conversationId: string | undefined, onStarted?: (c
       const request: ChatRequest = { ...input, conversationId };
 
       try {
+        let settled = false;
         for await (const event of streamChat(request, controller.signal)) {
           if (event.type === "start" && !conversationId) {
             onStarted?.(event.conversationId);
           }
+          if (event.type === "done" || event.type === "error") {
+            settled = true;
+          }
           dispatch({ type: "event", event });
+        }
+        if (!settled) {
+          // apps/api's contract guarantees the stream ends with a `done`
+          // or `error` frame — everything after `start` is caught
+          // server-side and turned into one or the other (see
+          // chat.controller.ts) — so reaching a clean end of the response
+          // body without ever seeing either one means the connection was
+          // cut from underneath us: a proxy/load balancer idle-closing it,
+          // or the server process dying mid-turn. `reader.read()`
+          // resolving `{ done: true }` isn't an exception, so the `catch`
+          // below never runs for this case either. Without this, the
+          // reducer was left wherever it last was (typically
+          // "searching"/"streaming") forever: Composer's Send button
+          // stayed disabled and MessageList's retry button never appeared
+          // (gated on `phase === "error"`), with no indication anything
+          // went wrong — the only way out was Stop or a page reload. See
+          // docs/DECISIONS.md.
+          dispatch({
+            type: "event",
+            event: { type: "error", code: "stream_ended_unexpectedly", message: "Connection closed unexpectedly. Try again." },
+          });
         }
       } catch (error) {
         if (controller.signal.aborted) {

@@ -2775,3 +2775,96 @@ this pass, following the same precedent as D8.2's keyword-floor decision
   optimistic-concurrency check — a real fix needs an API contract change
   (an `If-Match`/version field clients would have to start sending).
 
+### D9.6 — `apps/web`: conversation-switch desync and stuck-stream-on-clean-close, both fixed
+
+Agent 3's frontend pass, re-verified live against a running Playwright
+session rather than trusted from the report:
+
+1. **High: switching between two already-loaded conversations via the
+   sidebar silently kept posting into the old one.** `chat-view.tsx`
+   seeded `activeConversationId` with `useState(conversationId)` once and
+   never revisited it. `/chat/[id1]` and `/chat/[id2]` are the *same*
+   `page.tsx` file, so React reuses the same `ChatView` instance across
+   that navigation (no remount) and the initializer never re-runs — the
+   URL and sidebar highlight moved on, but the message list, composer, and
+   any outgoing message kept silently targeting the conversation that was
+   active when the component first mounted. Fixed with the "reset state
+   when a prop changes during render" pattern (already used by
+   `document-form.tsx`'s `lastSyncedDocument`): a `lastRouteConversationId`
+   state compared against the `conversationId` prop on every render,
+   resetting `activeConversationId` the moment they diverge. Confirmed
+   fixed with an isolated Playwright repro (hard `page.goto` to set up
+   both conversations, avoiding the unrelated D9.7 desync below): before
+   the fix, the message area kept showing conversation A's content after
+   switching to B; after, it correctly shows only B's.
+2. **Medium: a clean stream close with neither `done` nor `error` left the
+   UI stuck.** `apps/api`'s contract guarantees `/chat/stream` always ends
+   with a `done` or `error` SSE frame, but a proxy/load-balancer idle-close
+   or a server crash mid-turn can end the HTTP body cleanly without either
+   — `reader.read()` resolving `{done: true}` isn't an exception, so
+   `use-chat-stream.ts`'s `catch` block never ran for this case, and the
+   reducer was left in `"searching"`/`"streaming"` forever (Send disabled,
+   no retry button, no error shown). Fixed by tracking whether a
+   `done`/`error` event was actually seen during the stream loop and
+   synthesizing a `stream_ended_unexpectedly` error event if the loop
+   exits without one.
+
+Also added a same-instance abort: `chat-view.tsx`'s `useChatStream` call
+is keyed on `activeConversationId`, but a real navigation to a *different*
+conversation (fix 1's scenario) reuses the same `ChatView`/`useChatStream`
+instance rather than unmounting it, so the existing unmount-only abort
+cleanup (D6.16) never fired for it — a stream left running in the
+background after switching kept dispatching into the same reducer, now
+visually attached to whichever conversation the user switched to. Fixed
+with a `useEffect` keyed on the `conversationId` *prop* (not
+`activeConversationId` — see the code comment for why that distinction
+matters) that aborts on prop change or unmount.
+
+### D9.7 — `apps/web`: a newly-discovered router/URL desync, found and deliberately NOT fixed
+
+While reproducing D9.6's fix #1 against the exact scenario the smoke test
+was written to cover, found a second, distinct, previously-undocumented
+bug: `chat-view.tsx`'s `handleStarted` (adopting a brand-new
+conversation's server-assigned id — see D6.6) updates the address bar
+with a raw `window.history.replaceState` call specifically *because* a
+real Next.js navigation there would remount `ChatView` mid-stream (D6.6's
+whole point). But `history.replaceState` changes the visible URL without
+Next's App Router ever finding out — its own internal "current route"
+bookkeeping is separate from `window.location` and only gets updated by
+Next's own navigation APIs. A real `<Link>` click shortly afterward (e.g.
+the sidebar's "New conversation" link, right after a brand-new
+conversation just adopted its id) becomes a no-op from Next's
+perspective: the address bar *does* visibly update, but the underlying
+route segment tree is never swapped, so `ChatView` never re-renders with
+fresh props. Confirmed live with mount/unmount console instrumentation
+and a dedicated repro: a message typed into the composer after this then
+silently posts into the *old* conversation, with no visible error, even
+though the URL bar shows the new one.
+
+Two candidate fixes were tried and rejected, each verified with its own
+live reproduction rather than assumed to work from reading Next's docs:
+
+1. **Calling `router.refresh()` right after the `replaceState` call**, to
+   ask Next to resync its bookkeeping to the new URL. Did not fix the
+   repro — the subsequent `<Link>` navigation still no-op'd identically
+   with or without it.
+2. **Replacing the raw `history.replaceState` call with Next's own
+   `router.replace()`.** This *did* fix the desync (the repro passed), but
+   mount/unmount instrumentation showed why: it remounts `ChatView` — the
+   exact mid-stream-discard bug D6.6 already fixed, and confirmed worse
+   here, since it fires for *every* brand-new conversation's first turn,
+   not just the edge case this was meant to fix. Rejected outright.
+
+Deferred rather than half-fixed, consistent with this project's handling
+of D9.5's TOCTOU race and missing-optimistic-concurrency findings: a real
+fix needs a routing-architecture change — most plausibly, restructuring
+`/chat` and `/chat/[conversationId]` so they no longer render `ChatView`
+as two independent leaf `page.tsx` components (e.g. hoisting it into a
+shared layout, or an intercepting/parallel route, so a real navigation
+between them updates params without ever unmounting it) — rather than a
+one-line patch to the adoption mechanism. `smoke.spec.ts`'s
+conversation-switching test was written to use a hard `page.goto` for its
+"start conversation B" step rather than clicking "New conversation",
+specifically to keep it scoped to D9.6's fix (which it does verify) rather
+than tripping over this separate, deferred bug.
+

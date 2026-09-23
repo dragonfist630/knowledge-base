@@ -130,3 +130,74 @@ test("full walkthrough: signup, documents, chat, usage, mobile nav", async ({ pa
     await expect(page).toHaveURL(/\/documents$/);
   });
 });
+
+test("switching between two existing conversations via the sidebar shows the right conversation, not the last one open", async ({
+  page,
+}) => {
+  const email = `e2e-switch-${Date.now()}@example.com`;
+  const password = "e2e-password-123";
+
+  await test.step("sign up", async () => {
+    await page.goto("/signup");
+    await page.getByLabel("Email").fill(email);
+    await page.getByLabel("Password").fill(password);
+    await page.getByRole("button", { name: "Sign up" }).click();
+    await expect(page).toHaveURL(/\/documents$/, { timeout: 15_000 });
+  });
+
+  const messageArea = page.locator('div[aria-live="polite"].overflow-y-auto');
+  // Distinct first words so each becomes an unambiguous conversation
+  // title (chat.service.ts titles a conversation from its first message's
+  // own text — see createConversation) and so the two answers/messages
+  // can never be mistaken for each other in the assertions below.
+  const questionA = "Alpha marker question about the knowledge base.";
+  const questionB = "Bravo marker question, completely unrelated to Alpha.";
+  let urlA = "";
+  let urlB = "";
+
+  await test.step("start conversation A", async () => {
+    await page.goto("/chat");
+    await page.getByPlaceholder("Ask a question about your documents…").fill(questionA);
+    await page.getByRole("button", { name: "Send message" }).click();
+    await expect(page).toHaveURL(/\/chat\/[^/]+$/, { timeout: 15_000 });
+    urlA = page.url();
+    await expect(messageArea).toContainText(questionA, { timeout: 20_000 });
+  });
+
+  await test.step("start conversation B", async () => {
+    // A hard reload to /chat rather than clicking the sidebar's "New
+    // conversation" link: that link click is a real Next.js Link
+    // navigation, and clicking it this soon after conversation A adopted
+    // its id via chat-view.tsx's `history.replaceState` call runs into a
+    // separate, deeper bug in Next's App Router bookkeeping — see D9.7 in
+    // docs/DECISIONS.md. That bug is real but deliberately not fixed this
+    // pass; a `page.goto` here (a full navigation, which always resyncs
+    // Next's router state) keeps this test scoped to the conversation-
+    // switch bug it actually targets, the same way the isolated repro used
+    // to confirm that bug's fix stayed clear of D9.7 by doing the same.
+    await page.goto("/chat");
+    await page.getByPlaceholder("Ask a question about your documents…").fill(questionB);
+    await page.getByRole("button", { name: "Send message" }).click();
+    await expect(page).toHaveURL(/\/chat\/[^/]+$/, { timeout: 15_000 });
+    urlB = page.url();
+    expect(urlB).not.toBe(urlA);
+    await expect(messageArea).toContainText(questionB, { timeout: 20_000 });
+  });
+
+  await test.step("switch back to conversation A via the sidebar — same page.tsx instance as B, no remount", async () => {
+    // Regression guard: chat-view.tsx's `activeConversationId` used to be
+    // seeded once from the route param via `useState(conversationId)` and
+    // never re-synced when that param changed. /chat/[id1] and
+    // /chat/[id2] are the SAME page.tsx file, so React reuses the same
+    // ChatView instance across this navigation (unlike the /chat <->
+    // /chat/[id] transition above) and never re-runs that initializer.
+    // Before the fix, clicking a different, already-existing conversation
+    // in the sidebar updated the URL and the sidebar highlight but kept
+    // showing — and would keep posting new messages into — whichever
+    // conversation was active before. See docs/DECISIONS.md.
+    await page.getByRole("link", { name: /Alpha marker question/ }).click();
+    await expect(page).toHaveURL(urlA);
+    await expect(messageArea).toContainText(questionA, { timeout: 10_000 });
+    await expect(messageArea).not.toContainText(questionB);
+  });
+});
