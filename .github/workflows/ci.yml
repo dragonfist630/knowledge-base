@@ -1,0 +1,196 @@
+name: CI
+
+# Runs the exact same checks this project has always been verified with
+# locally before every commit (see docs/DECISIONS.md's repeated "full
+# pipeline and the full Gate 6 Playwright suite re-ran clean" — this
+# workflow automates that instead of relying on it being re-run by hand
+# every time). See docs/DECISIONS.md D9.13 for why this didn't exist
+# before, and docs/DEPLOYMENT.md for how this fits with the Dockerfiles
+# this same change adds.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The e2e harnesses (apps/api/test/e2e/global-setup.ts,
+  # apps/web/e2e/global-setup.ts) default to exactly this already — set
+  # explicitly here anyway so this workflow keeps working even if that
+  # default ever changes, and so it's visible without reading their source.
+  E2E_POSTGRES_SUPERUSER_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+
+jobs:
+  checks:
+    name: Typecheck, lint, unit tests
+    runs-on: ubuntu-latest
+    # `pnpm test` needs a reachable Redis for apps/api's RedisThrottlerStorage
+    # spec (D9.15) — real, not mocked, same rationale as this project's other
+    # infra-backed tests, and light enough (no schema/auth) to belong in this
+    # job rather than pulled into the heavier e2e-api job's Postgres+PostgREST
+    # harness. See docs/DECISIONS.md D9.15 and the spec file's own doc comment.
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s --health-timeout=3s --health-retries=5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # turbo.json's typecheck/lint/test tasks all declare
+      # `dependsOn: ["^build"]`, so each of these builds every workspace
+      # package (@kb/shared, @kb/ai, @kb/rag-core) it needs on its own —
+      # no separate `pnpm build` step first, matching how these are run
+      # locally throughout this project's history (see docs/DECISIONS.md).
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm test
+
+  e2e-api:
+    name: "Gate 3: apps/api e2e (real Postgres + RLS + PostgREST)"
+    runs-on: ubuntu-latest
+    # No Docker/local Supabase CLI here on purpose — apps/api/test/e2e/global-setup.ts
+    # is a deliberately Docker-free harness (docs/DECISIONS.md D3.1) that
+    # orchestrates a real ephemeral database, the real supabase/migrations/*.sql
+    # applied unmodified, and a real (auto-downloaded) PostgREST binary
+    # against whatever Postgres it's pointed at — this service container
+    # is that Postgres.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=10s --health-timeout=5s --health-retries=5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Install psql (the e2e harness shells out to it directly)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
+
+      # scripts/e2e-fetch-postgrest.mjs auto-downloads a pinned static
+      # PostgREST binary into this path on first run — cached across CI
+      # runs so a normal PR doesn't re-download it every time.
+      - name: Cache PostgREST binary
+        uses: actions/cache@v4
+        with:
+          path: .cache/postgrest
+          key: postgrest-linux-x64-12.2.3
+
+      # Builds every workspace package + both apps in dependency order —
+      # apps/api's own e2e run needs its real `dist/`, same as any other
+      # `NODE_ENV=production`-shaped run.
+      - run: pnpm build
+
+      - run: pnpm --filter api test:e2e
+
+  e2e-web:
+    name: "Gate 6: apps/web e2e (real Chromium)"
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=10s --health-timeout=5s --health-retries=5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Install psql
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
+
+      - name: Cache PostgREST binary
+        uses: actions/cache@v4
+        with:
+          path: .cache/postgrest
+          key: postgrest-linux-x64-12.2.3
+
+      # Gate 6's playwright.config.ts starts apps/api as `node dist/main.js`
+      # (a real built server, not `nest start --watch`) and apps/web as
+      # `next dev` (dev mode is deliberate there — see e2e/global-setup.ts);
+      # only apps/api needs to actually be built beforehand.
+      - run: pnpm build
+
+      - name: Install Playwright's Chromium + OS deps
+        run: pnpm --filter web exec playwright install --with-deps chromium
+
+      - run: pnpm test:e2e
+
+  docker-build:
+    name: Docker images build
+    runs-on: ubuntu-latest
+    # Proves apps/api/Dockerfile and apps/web/Dockerfile actually build —
+    # the one part of this change that couldn't be verified the same way
+    # as everything else in this project (by literally running it) before
+    # landing, since the sandbox it was written in has no route to Docker
+    # Hub (org egress policy) to pull the node:22-alpine base image; a
+    # GitHub Actions runner has normal registry access. See
+    # docs/DECISIONS.md D9.13 for exactly what WAS verified locally (every
+    # RUN step's actual commands, replicated by hand outside Docker) and
+    # what this job closes the gap on.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build apps/api image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/api/Dockerfile
+          push: false
+
+      - name: Build apps/web image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/web/Dockerfile
+          push: false
+          # Placeholder values — this job only proves the image builds,
+          # not that it's configured for a real deployment. See
+          # apps/web/Dockerfile's own top-of-file comment for what a real
+          # build needs these to be.
+          build-args: |
+            NEXT_PUBLIC_API_URL=http://localhost:3001
+            NEXT_PUBLIC_SUPABASE_URL=http://localhost:54321
+            NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=ci-placeholder-key
+            NEXT_PUBLIC_SITE_URL=http://localhost:3000
