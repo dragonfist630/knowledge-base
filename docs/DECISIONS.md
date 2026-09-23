@@ -2893,3 +2893,80 @@ against a real Postgres/PostgREST/auth-gateway stack. No scratch/demo
 files were committed — the temporary debug instrumentation and e2e repro
 files used while investigating D9.6/D9.7 were removed before this pass
 was considered done.
+
+### D9.10 — Fixing D9.7 for real: move `ChatView` into a shared layout instead of patching around the remount
+
+D9.7 documented a real bug (a real `<Link>` navigation shortly after a
+brand-new conversation's `history.replaceState`-based URL adoption could
+silently become a no-op) and deliberately deferred it, because the two
+patches tried at the time both failed: `router.refresh()` didn't fix the
+desync, and switching to `router.replace()` fixed the desync but
+reintroduced D6.6's original, worse bug (a mid-stream remount), since
+`/chat` and `/chat/[conversationId]` were two separate leaf `page.tsx`
+files and a real navigation between them always remounted whatever they
+rendered.
+
+That structure was the actual root cause, not something to route around:
+`ChatView` had to live in one or the other page component, so any change
+in which page was "current" was a remount by construction. Fixed by
+moving `ChatView` into a new `apps/web/src/app/(app)/chat/layout.tsx`,
+shared by both routes — App Router keeps a layout mounted across
+navigations to its own child segments, so this is no longer a remount at
+all. `chat/page.tsx` and `chat/[conversationId]/page.tsx` are now trivial
+stubs returning `null` (a route still needs a `page.tsx` to be navigable,
+but there's nothing left for either of these ones to render). The layout
+reads `conversationId` via `useParams()` (a *layout* only receives
+`params` for its own segment and above, and `conversationId` belongs to
+the child `[conversationId]` segment one level down — `useParams()` is
+the client-side hook that still resolves the full current route's params
+regardless of which layout level calls it) and `documentIds` via
+`useSearchParams()` (layouts never receive a `searchParams` prop at all,
+specifically so a search-param-only change doesn't invalidate a persisted
+layout — this codebase already has a documented preference for reading
+search params via `use()` on a promise prop instead, in
+`documents/[id]/page.tsx`, but that option doesn't exist for a layout).
+
+With the remount gone, `chat-view.tsx`'s `handleStarted` now adopts a
+brand-new conversation's id with a real `router.replace()` instead of the
+raw `history.replaceState` call — eliminating D9.7's desync at the root,
+since Next's own router now finds out about every URL change instead of
+being bypassed. Verified with the exact D9.7 repro (send from /chat,
+click "New conversation" immediately after adoption, send again): before
+this fix it failed (the second send silently reused the first
+conversation's id); after, both conversations get their own id and
+switching back to the first via the sidebar still shows only its own
+content. Also re-verified D6.6's original concern with mount/unmount
+console instrumentation across the adoption transition: zero
+unmounts, confirming the layout move didn't just trade one remount bug
+for another.
+
+That change had one further consequence, also fixed here: `ChatView`
+(and the `useChatStream` instance it owns) is now the same persisted
+instance across *every* conversation switch, not just between two
+already-existing conversations the way D9.6 already handled — including
+switching away from a conversation whose turn already finished. A
+finished turn's `useChatStream` state doesn't reset itself just because
+the caller starts passing a different `conversationId`; `chat-view.tsx`'s
+`showStreamingTurn` check has no way to know a stale, already-completed
+turn belongs to a *different* conversation than the one now on screen, so
+it rendered the old conversation's finished answer as if it were live, on
+top of the new conversation's real history. Confirmed live: switching
+A -> "New conversation" -> B -> back to A showed both A's and B's
+question/answer pairs concatenated in the same message area before this
+fix. Fixed by adding an explicit `reset()` to `useChatStream` (dispatches
+back to `IDLE_STATE`) and calling it, alongside the existing `stop()`,
+from the exact same "this was a real navigation away, not our own
+turn's self-adoption" branch `chat-view.tsx` already had for D6.16's
+abort-on-navigation effect — the same self-adoption-vs-real-navigation
+distinction that effect already needed turned out to be exactly what this
+needed too, since `stop()` alone only aborts a still-in-flight fetch and
+does nothing for a turn that had already settled by the time the user
+switched away.
+
+`smoke.spec.ts`'s conversation-switching test now exercises the real
+"New conversation" sidebar link for its "start conversation B" step again
+(D9.7 had it use a hard `page.goto` instead, specifically to stay clear of
+the then-unfixed desync) — this is now the regression guard for D9.7
+itself, not just a workaround to avoid tripping over it. Full pipeline
+(typecheck/lint/test/build) and the full Gate 6 Playwright suite re-ran
+clean after this fix.

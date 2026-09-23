@@ -1,10 +1,7 @@
-"use client";
-
-import { use } from "react";
-
-import { ChatView } from "@/features/chat/components/chat-view";
-
-export default function ConversationPage({ params }: PageProps<"/chat/[conversationId]">) {
-  const { conversationId } = use(params);
-  return <ChatView conversationId={conversationId} />;
+// The real UI lives in ../layout.tsx, shared with /chat — see its own doc
+// comment (and docs/DECISIONS.md D9.10) for why. This page renders
+// nothing of its own; it exists only because Next.js requires a page.tsx
+// for a segment to be a navigable route at all.
+export default function ConversationPage() {
+  return null;
 }

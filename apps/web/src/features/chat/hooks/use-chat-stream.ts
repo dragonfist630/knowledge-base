@@ -26,7 +26,7 @@ export interface ChatStreamState {
 const IDLE_STATE: ChatStreamState = { phase: "idle", text: "", sources: [], citedSourceIds: [] };
 const SENDING_STATE: ChatStreamState = { ...IDLE_STATE, phase: "searching" };
 
-type Action = { type: "sending" } | { type: "event"; event: ChatEvent } | { type: "aborted" };
+type Action = { type: "sending" } | { type: "event"; event: ChatEvent } | { type: "aborted" } | { type: "reset" };
 
 /**
  * "Streaming chat state lives in a single useChatStream hook with a
@@ -52,6 +52,7 @@ function reducer(state: ChatStreamState, action: Action): ChatStreamState {
   // docs/DECISIONS.md Phase 6, D6.16.
   if (action.type === "sending") return SENDING_STATE;
   if (action.type === "aborted") return { ...state, phase: "done", finishReason: "aborted" };
+  if (action.type === "reset") return IDLE_STATE;
 
   const { event } = action;
   switch (event.type) {
@@ -92,9 +93,15 @@ export interface SendChatInput {
  * conversation); `onStarted` fires as soon as the `start` event reports
  * the server-assigned conversationId, so the caller can adopt it
  * immediately rather than waiting for the whole answer to finish — see
- * chat-view.tsx's own doc comment for why that adoption must NOT be a
- * real Next.js navigation (it would unmount this hook's instance
- * mid-stream) and instead updates local state plus the URL bar directly.
+ * chat-view.tsx's own doc comment for why that adoption is safe to do
+ * with a real Next.js navigation (docs/DECISIONS.md D9.10).
+ *
+ * One hook instance now outlives any single conversation — chat-view.tsx
+ * (docs/DECISIONS.md D9.10) keeps it mounted across every conversation
+ * switch, not just a brand-new one adopting its id — so `state` does NOT
+ * reset itself just because the caller starts passing a different
+ * `conversationId`; see `reset` below for why the caller has to do that
+ * explicitly.
  */
 export function useChatStream(conversationId: string | undefined, onStarted?: (conversationId: string) => void) {
   const [state, dispatch] = useReducer(reducer, IDLE_STATE);
@@ -177,14 +184,35 @@ export function useChatStream(conversationId: string | undefined, onStarted?: (c
 
   // Without this, navigating away mid-stream (clicking "Documents" in the
   // nav, say — a real App Router navigation, unlike the same-conversation
-  // history.replaceState adoption this hook's own doc comment explains)
-  // unmounts this hook instance but leaves its fetch running to completion
-  // in the background: wasted tokens on a request nothing will ever render,
-  // and a `finally` that still fires and invalidates conversationsKeys.all
+  // adoption this hook's own doc comment explains) unmounts this hook
+  // instance but leaves its fetch running to completion in the
+  // background: wasted tokens on a request nothing will ever render, and
+  // a `finally` that still fires and invalidates conversationsKeys.all
   // for a component no longer on screen. See docs/DECISIONS.md Phase 6,
   // D6.16.
   useEffect(() => {
     return () => abortRef.current?.abort();
+  }, []);
+
+  // Explicit reset back to IDLE_STATE, for the caller to call when the
+  // user switches to a DIFFERENT conversation (or back to "new
+  // conversation") rather than this hook's own turn adopting an id.
+  // Needed only because of D9.10: this hook instance now persists across
+  // conversation switches instead of getting a fresh instance (and fresh
+  // reducer state) from a remount every time. Without an explicit reset,
+  // `state` from a just-finished turn in conversation A kept being
+  // treated as "the live turn" after switching to conversation B (or to a
+  // brand-new one) — `chat-view.tsx`'s `showStreamingTurn` check
+  // (`phase !== "idle" && !historyHasAssistant`) has no way to know A's
+  // assistant message isn't part of B's history, so it would render A's
+  // finished answer as if it were an in-progress turn on top of B's real
+  // history. `stop()` alone doesn't fix this — it only aborts a live
+  // fetch, it doesn't touch `state` once the turn has already settled.
+  // See docs/DECISIONS.md D9.10; the caller (chat-view.tsx) is what can
+  // tell "switched away" apart from "this turn's own self-adoption", not
+  // this hook.
+  const reset = useCallback(() => {
+    dispatch({ type: "reset" });
   }, []);
 
   const retry = useCallback(() => {
@@ -196,6 +224,7 @@ export function useChatStream(conversationId: string | undefined, onStarted?: (c
     send,
     stop,
     retry,
+    reset,
     isStreaming: state.phase === "searching" || state.phase === "streaming",
   };
 }

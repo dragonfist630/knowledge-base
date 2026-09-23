@@ -164,18 +164,18 @@ test("switching between two existing conversations via the sidebar shows the rig
     await expect(messageArea).toContainText(questionA, { timeout: 20_000 });
   });
 
-  await test.step("start conversation B", async () => {
-    // A hard reload to /chat rather than clicking the sidebar's "New
-    // conversation" link: that link click is a real Next.js Link
-    // navigation, and clicking it this soon after conversation A adopted
-    // its id via chat-view.tsx's `history.replaceState` call runs into a
-    // separate, deeper bug in Next's App Router bookkeeping — see D9.7 in
-    // docs/DECISIONS.md. That bug is real but deliberately not fixed this
-    // pass; a `page.goto` here (a full navigation, which always resyncs
-    // Next's router state) keeps this test scoped to the conversation-
-    // switch bug it actually targets, the same way the isolated repro used
-    // to confirm that bug's fix stayed clear of D9.7 by doing the same.
-    await page.goto("/chat");
+  await test.step("start conversation B via 'New conversation'", async () => {
+    // A real navigation, clicked right after conversation A adopted its
+    // id — this exact sequence used to desync Next's App Router
+    // bookkeeping from the real URL and silently turn this click into a
+    // no-op (D9.7). Fixed in D9.10 by moving ChatView into chat/layout.tsx
+    // (shared by /chat and /chat/[id], so it's never remounted) and
+    // routing conversation adoption through a real `router.replace()`
+    // instead of a raw `history.replaceState` call — see chat-view.tsx.
+    // Regression guard for that fix: this must be a real Link click, not
+    // a page.goto, or it wouldn't catch a reintroduction of D9.7.
+    await page.getByRole("link", { name: "New conversation" }).click();
+    await expect(page).toHaveURL(/\/chat$/);
     await page.getByPlaceholder("Ask a question about your documents…").fill(questionB);
     await page.getByRole("button", { name: "Send message" }).click();
     await expect(page).toHaveURL(/\/chat\/[^/]+$/, { timeout: 15_000 });

@@ -1,6 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 
 import { Composer, type ComposerSubmitInput } from "@/features/chat/components/composer";
 import { ConversationList } from "@/features/chat/components/conversation-list";
@@ -11,57 +12,40 @@ import { useConversation } from "@/features/chat/hooks/use-conversation";
 import { isAssistantMessageSettled } from "@/features/chat/stream-history.mjs";
 
 /**
- * Shared by /chat (no conversation yet) and /chat/[conversationId] — as
- * two separate route files rendering this component, not one component
- * parameterized by a route param, so a real Next.js navigation between
- * them unmounts and remounts it. That matters for the very first turn of
- * a brand-new conversation: the server's `start` SSE event (which reports
- * the newly-created conversationId) arrives before any `delta`, so
- * `router.replace()`-ing from /chat to /chat/[id] the moment it arrives
- * used to remount this component mid-stream, silently discarding the
- * live `useChatStream` instance — the in-flight fetch kept running and
- * dispatching into a reducer nothing was listening to anymore, so the
- * answer never rendered token-by-token; it only appeared once the whole
- * turn finished and a background query refetch pulled in the persisted
- * result. Worse, a stream error arriving after `start` was lost
- * entirely, with nothing in the UI to show it. Fixed by tracking the
- * "adopted" conversation id as local state instead of relying on the
- * route param, and updating the URL with `history.replaceState` (no
- * Next.js navigation, so no remount) rather than `router.replace` — see
- * docs/DECISIONS.md Phase 6, D6.6.
- *
- * That `history.replaceState` call has its own known limitation — see
- * D9.7 in docs/DECISIONS.md: it changes the visible URL without Next's
- * App Router ever finding out, and a real `<Link>` navigation clicked
- * shortly afterward can then desync. Deliberately NOT fixed this pass —
- * see D9.7 for the two mitigations that were tried and rejected (one did
- * nothing, the other reintroduced this exact mid-stream remount bug, only
- * worse) and why a real fix needs a routing-architecture change instead.
+ * Rendered once by chat/layout.tsx, shared by /chat (no conversation yet)
+ * and /chat/[conversationId] — see that layout's own doc comment for why
+ * a *layout* rather than one instance per route file. That restructuring
+ * (docs/DECISIONS.md D9.10) is what makes it safe for `handleStarted`
+ * below to adopt a brand-new conversation's server-assigned id with a
+ * real `router.replace()`: the layout stays mounted across that
+ * navigation (same as any other /chat <-> /chat/[id] transition now), so
+ * there's no remount to avoid and no need for the raw
+ * `window.history.replaceState` workaround this component used to use —
+ * that workaround changed the visible URL without Next's own router ever
+ * finding out, which is exactly what D9.7 found broke a *later*
+ * navigation. See D6.6 for the original mid-stream-remount bug this
+ * whole area of the code exists to avoid, and D9.7/D9.10 for the
+ * workaround's own bug and this fix.
  *
  * A fixed-ish height (rather than filling the viewport exactly) so it
  * doesn't fight the (app) layout's own `<main>` scroll region — see
  * docs/DECISIONS.md Phase 6.
  */
 export function ChatView({ conversationId, initialScope }: { conversationId?: string; initialScope?: ChatScope }) {
+  const router = useRouter();
   const [activeConversationId, setActiveConversationId] = useState(conversationId);
 
   // Keep `activeConversationId` in sync when the ROUTE's own
   // `conversationId` prop changes — e.g. the sidebar linking from one
-  // existing conversation to another. /chat/[conversationId]/page.tsx and
-  // this component are the SAME mounted instance for any such navigation
-  // (same file, only the dynamic segment's value differs), so React does
-  // NOT remount it and `activeConversationId`'s initial value is never
-  // revisited on its own. This is the inverse of the bug this component's
-  // doc comment above already explains: a *brand-new* conversation
-  // adopting a real id must NOT trigger a real navigation (it would
-  // unmount mid-stream), but switching between two *already-existing*
-  // conversations is a real navigation that never remounts at all.
-  // Without this, the message list, composer, and any outgoing message
-  // kept silently targeting whichever conversation was active when this
-  // instance first mounted, while the sidebar and URL had already moved
-  // on — a user could end up sending a message into the wrong
-  // conversation with no visible error. See docs/DECISIONS.md. Adjusting
-  // state during render (rather than in a useEffect) per
+  // existing conversation to another, or (now that chat/layout.tsx keeps
+  // this component mounted across every /chat <-> /chat/[id] transition,
+  // not just between two existing [id]s) a brand-new conversation
+  // adopting its id via `handleStarted` below. Without this, the message
+  // list, composer, and any outgoing message would keep silently
+  // targeting whichever conversation was active when this instance first
+  // mounted, while the sidebar and URL had already moved on. See
+  // docs/DECISIONS.md. Adjusting state during render (rather than in a
+  // useEffect) per
   // https://react.dev/reference/react/useState#storing-information-from-previous-renders
   // — the same "resetting state when a prop changes" pattern
   // document-form.tsx already uses for the analogous document-prop-changed
@@ -75,33 +59,59 @@ export function ChatView({ conversationId, initialScope }: { conversationId?: st
   const { data: conversation } = useConversation(activeConversationId);
   const [pendingUserText, setPendingUserText] = useState<string>();
 
-  const handleStarted = useCallback((newConversationId: string) => {
-    setActiveConversationId(newConversationId);
-    // Keeps the address bar (and refresh/bookmark/share) correct without
-    // triggering an actual App Router navigation — see this component's
-    // own doc comment above for why a real navigation here is the bug, and
-    // D9.7 in docs/DECISIONS.md for this call's own known, deliberately
-    // unfixed side effect.
-    window.history.replaceState(null, "", `/chat/${newConversationId}`);
-  }, []);
+  // Set by `handleStarted` immediately before it navigates, so the abort
+  // effect below can tell "the conversationId prop is about to change
+  // because WE just adopted this id" apart from "the conversationId prop
+  // changed because the user navigated away" — see that effect's own
+  // comment for why the distinction matters.
+  const selfAdoptedIdRef = useRef<string>(undefined);
+
+  const handleStarted = useCallback(
+    (newConversationId: string) => {
+      setActiveConversationId(newConversationId);
+      selfAdoptedIdRef.current = newConversationId;
+      // A real Next.js navigation — safe now that chat/layout.tsx (not a
+      // per-route page.tsx) renders this component, so this never
+      // unmounts it. `scroll: false` since adopting an id mid-conversation
+      // shouldn't jump the viewport the way a fresh navigation normally
+      // would.
+      router.replace(`/chat/${newConversationId}`, { scroll: false });
+    },
+    [router],
+  );
 
   const chatStream = useChatStream(activeConversationId, activeConversationId ? undefined : handleStarted);
 
-  // Abort any in-flight turn the moment the ROUTE's own `conversationId`
-  // prop changes (a real navigation to a different conversation) or this
-  // component unmounts. Keyed on the prop, not `activeConversationId` —
-  // `handleStarted` above also changes `activeConversationId` (a brand-new
-  // conversation adopting its own id, mid-stream), and that transition
-  // must NOT abort the very turn that just started; only a navigation the
-  // user didn't initiate as part of this turn should. Without this, a
-  // stream left running in the background after switching conversations
-  // keeps dispatching into this same useChatStream instance's reducer —
-  // now visually attached to whichever conversation the user has since
+  // Abort any in-flight turn, and reset useChatStream's own state back to
+  // idle, the moment the ROUTE's own `conversationId` prop changes to
+  // something OTHER than what `handleStarted` itself just adopted (a real
+  // navigation the user initiated, away from this turn's conversation) or
+  // this component unmounts. `handleStarted` also changes `conversationId`
+  // (via its `router.replace`, mid-stream), and that transition must NOT
+  // abort or reset the very turn that just started — only a navigation
+  // the user didn't initiate as part of this turn should.
+  //
+  // Both halves matter, for different reasons: `stop()` avoids a stream
+  // left running in the background after switching conversations
+  // dispatching into this same useChatStream instance's reducer — now
+  // visually attached to whichever conversation the user has since
   // switched to, since useChatStream's own unmount-only cleanup (D6.16)
-  // never fires for this same-instance navigation. See docs/DECISIONS.md.
+  // never fires for this same-instance navigation (D9.10 made every
+  // conversation switch a same-instance navigation, not just this one).
+  // `reset()` covers the case `stop()` doesn't: a turn that already
+  // FINISHED before the user switched away has nothing left to abort, but
+  // useChatStream's state still holds it — without resetting it too, the
+  // old conversation's just-finished answer gets rendered as if it were a
+  // live turn on top of the new conversation's real history. See
+  // docs/DECISIONS.md D6.16, D9.10.
   useEffect(() => {
     return () => {
+      if (selfAdoptedIdRef.current !== undefined) {
+        selfAdoptedIdRef.current = undefined;
+        return;
+      }
       chatStream.stop();
+      chatStream.reset();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on conversationId (the prop), not activeConversationId; see comment above.
   }, [conversationId]);
