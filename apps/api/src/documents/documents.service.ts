@@ -92,6 +92,21 @@ export class DocumentsService {
     return document;
   }
 
+  /**
+   * `input.expectedUpdatedAt`, when the client sends it, is the
+   * `updatedAt` of the document version the edit was made against (see
+   * DocumentDetail/DocumentSummary — every read already carries it, so
+   * this needs no separate "give me a version token" round trip). Passed
+   * through to the repository's conditional update: a 0-hashChanged
+   * (tags-only) edit races just as easily as a content edit, so this
+   * check applies unconditionally, not only when hashChanged.
+   *
+   * Without this, two overlapping edits of the same document (two tabs,
+   * or a background reindex retry racing a manual edit) would silently
+   * resolve last-write-wins — the loser's edit vanishes with no error and
+   * no trace, since both requests read the SAME starting `existing` and
+   * neither ever sees the other's write. See docs/DECISIONS.md D9.12.
+   */
   async update(auth: AuthContext, id: string, input: DocumentUpdate): Promise<DocumentDetail> {
     const existing = await this.repository.findHashById(auth.db, id);
     if (!existing) {
@@ -104,14 +119,22 @@ export class DocumentsService {
     const nextHash = computeContentHash(nextTitle, nextContent);
     const hashChanged = nextHash !== existing.content_hash;
 
-    const updated = await this.repository.update(auth.db, id, {
-      title: nextTitle,
-      content: nextContent,
-      tags: nextTags,
-      ...(hashChanged
-        ? { content_hash: nextHash, index_status: "pending" as const, index_error: null }
-        : {}),
-    });
+    const updated = await this.repository.update(
+      auth.db,
+      id,
+      {
+        title: nextTitle,
+        content: nextContent,
+        tags: nextTags,
+        ...(hashChanged
+          ? { content_hash: nextHash, index_status: "pending" as const, index_error: null }
+          : {}),
+      },
+      input.expectedUpdatedAt,
+    );
+    if (updated === "conflict") {
+      throw new ConflictException("This document was changed elsewhere since you last loaded it. Refresh and try again.");
+    }
     if (!updated) {
       throw new NotFoundException("Document not found.");
     }
@@ -138,11 +161,18 @@ export class DocumentsService {
       throw new ConflictException("Only a document in a failed index state can be reindexed.");
     }
 
+    // No expectedUpdatedAt here, so repository.update can only ever
+    // return a real DocumentDetail or null (never "conflict" — that
+    // outcome is only possible when a version check was actually
+    // requested, see documents.repository.ts's update()). The `=== null`
+    // check (rather than `!updated`) exists purely so the "conflict"
+    // branch stays visibly unreachable to the type checker, not because
+    // it can happen in practice.
     const updated = await this.repository.update(auth.db, id, {
       index_status: "pending",
       index_error: null,
     });
-    if (!updated) {
+    if (updated === null || updated === "conflict") {
       throw new NotFoundException("Document not found.");
     }
 

@@ -293,6 +293,93 @@ describe("Documents (e2e)", () => {
     expect(pagedIds.sort()).toEqual([doc1.body.id, doc2.body.id, doc3.body.id].sort());
   });
 
+  it("update: expectedUpdatedAt enables optimistic-concurrency conflict detection (D9.12)", async () => {
+    const createRes = await request(app.getHttpServer())
+      .post("/documents")
+      .set("Authorization", authed(userA.jwt))
+      .send({ title: "Concurrency probe", content: "v1" })
+      .expect(201);
+    const docId: string = createRes.body.id;
+    const originalUpdatedAt: string = createRes.body.updatedAt;
+
+    // A save that sends the CURRENT updatedAt as expectedUpdatedAt
+    // succeeds normally, and comes back with a NEW updatedAt (the trigger
+    // bumps it since content actually changed).
+    const firstEditRes = await request(app.getHttpServer())
+      .patch(`/documents/${docId}`)
+      .set("Authorization", authed(userA.jwt))
+      .send({ content: "v2 (tab A's edit)", expectedUpdatedAt: originalUpdatedAt })
+      .expect(200);
+    const afterFirstEditUpdatedAt: string = firstEditRes.body.updatedAt;
+    expect(afterFirstEditUpdatedAt).not.toBe(originalUpdatedAt);
+
+    // A second save that still believes the ORIGINAL (now-stale)
+    // updatedAt is current — as if "tab B" had loaded the document before
+    // tab A's edit landed, and only now tries to save its own,
+    // independently-made edit — must be rejected with 409, not silently
+    // overwrite tab A's already-saved edit (the lost-update this whole
+    // feature exists to prevent).
+    const conflictRes = await request(app.getHttpServer())
+      .patch(`/documents/${docId}`)
+      .set("Authorization", authed(userA.jwt))
+      .send({ content: "v2 (tab B's conflicting edit)", expectedUpdatedAt: originalUpdatedAt })
+      .expect(409);
+    expect(conflictRes.body.code).toBe("conflict");
+
+    // Tab A's edit really is still there — untouched by tab B's rejected
+    // attempt.
+    const afterConflictRes = await request(app.getHttpServer())
+      .get(`/documents/${docId}`)
+      .set("Authorization", authed(userA.jwt))
+      .expect(200);
+    expect(afterConflictRes.body.content).toBe("v2 (tab A's edit)");
+    expect(afterConflictRes.body.updatedAt).toBe(afterFirstEditUpdatedAt);
+
+    // Retrying with the NOW-current updatedAt succeeds.
+    const retryRes = await request(app.getHttpServer())
+      .patch(`/documents/${docId}`)
+      .set("Authorization", authed(userA.jwt))
+      .send({ content: "v3 (tab B's retry after reloading)", expectedUpdatedAt: afterFirstEditUpdatedAt })
+      .expect(200);
+    expect(retryRes.body.content).toBe("v3 (tab B's retry after reloading)");
+
+    // Omitting expectedUpdatedAt entirely is still accepted — backward
+    // compatible: an older client (or a script) that never fetched a
+    // baseline keeps the previous last-write-wins behavior rather than
+    // being forced to opt in.
+    await request(app.getHttpServer())
+      .patch(`/documents/${docId}`)
+      .set("Authorization", authed(userA.jwt))
+      .send({ tags: ["no-version-check"] })
+      .expect(200);
+
+    // A tags-only edit races just as easily as a content edit — the check
+    // must apply unconditionally, not only when hashChanged (content_hash
+    // deliberately excludes tags — see computeContentHash).
+    const tagsRaceBaseline: string = (
+      await request(app.getHttpServer()).get(`/documents/${docId}`).set("Authorization", authed(userA.jwt)).expect(200)
+    ).body.updatedAt;
+    await request(app.getHttpServer())
+      .patch(`/documents/${docId}`)
+      .set("Authorization", authed(userA.jwt))
+      .send({ tags: ["fresh-tag"] })
+      .expect(200); // bumps updated_at again, making tagsRaceBaseline stale
+    const tagsConflictRes = await request(app.getHttpServer())
+      .patch(`/documents/${docId}`)
+      .set("Authorization", authed(userA.jwt))
+      .send({ tags: ["stale-tag-only-edit"], expectedUpdatedAt: tagsRaceBaseline })
+      .expect(409);
+    expect(tagsConflictRes.body.code).toBe("conflict");
+  });
+
+  it("update: 404 (not 409) for a nonexistent document even when expectedUpdatedAt is sent", async () => {
+    await request(app.getHttpServer())
+      .patch("/documents/00000000-0000-0000-0000-000000000000")
+      .set("Authorization", authed(userA.jwt))
+      .send({ title: "hijacked", expectedUpdatedAt: new Date().toISOString() })
+      .expect(404);
+  });
+
   it("reindex: 409 on a document that isn't in a failed state, 404 on a nonexistent one", async () => {
     const createRes = await request(app.getHttpServer())
       .post("/documents")

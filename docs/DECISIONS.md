@@ -3039,3 +3039,106 @@ prevents. `packages/shared/src/database.types.ts` and its built `dist/`
 surfaced this immediately as a stale-type error) both updated. Full
 pipeline and the full Gate 6 Playwright suite (which applies every
 migration fresh, including this one) re-ran clean.
+
+### D9.12 — Optimistic concurrency on document saves (lost-update prevention)
+
+`documents.service.ts`'s `update()` has always been a plain read-then-write:
+`findHashById` reads the current row, the service computes the next
+`title`/`content`/`tags`/`content_hash` against what it just read, and
+`repository.update()` writes them back unconditionally. Two overlapping
+edits of the SAME document — two browser tabs, a stale page left open
+overnight, or a manual edit racing an automated one — both read the same
+starting row and neither request ever sees the other's write. Whichever
+PATCH lands second wins outright and silently discards the first one's
+edit, with no error, no conflict signal, and no trace in the response —
+exactly a classic lost update. This was always possible; nothing in the
+Phase 9 audit had specifically exercised two concurrent edits of one
+document to notice it.
+
+The fix needs a version token the client can prove it read before editing.
+`documents.updated_at` already is one: `set_documents_updated_at()`
+(`supabase/migrations/20260916233538_init.sql`) bumps it via
+`IS DISTINCT FROM (old.title, old.content, old.tags)` on ANY of those three
+fields, and it's already returned to every client on every read via
+`DocumentDetail`/`DocumentSummary.updatedAt` — no new column or migration
+needed, unlike D9.11's fix. (`content_hash` was considered and rejected:
+it deliberately excludes tags — see `computeContentHash`'s doc comment —
+so a tags-only edit wouldn't be caught by it, and tags-only edits race
+exactly as easily as content edits.)
+
+`DocumentUpdateSchema` (`packages/shared/src/documents.ts`) gained an
+optional `expectedUpdatedAt` field. Optional, not required: an older
+client, a script, or any caller that never fetched a baseline keeps the
+previous last-write-wins behavior rather than being forced to opt in — this
+is a defense a caller can ask for, not a breaking contract change.
+
+`documents.repository.ts`'s `update()` now takes an optional
+`expectedUpdatedAt` and, when given, adds `.eq("updated_at",
+expectedUpdatedAt)` to the update's own `WHERE` clause — an atomic
+compare-and-swap at the database level, not a separate check-then-write
+(which would just reintroduce the same race one layer up). A conditional
+update that affects 0 rows is ambiguous on its own: the id might not exist
+at all, or it might exist with a DIFFERENT `updated_at` (someone else's
+write already landed). Only in that ambiguous case — never on the common
+paths, which still take one round trip exactly as before — one extra
+existence check (run under the same caller-scoped, RLS-enforced client as
+everything else here) tells the two apart, and the method returns the
+literal string `"conflict"` for the second one so the caller can map it to
+409 rather than a misleading 404. `documents.service.ts`'s `update()` now
+passes `input.expectedUpdatedAt` through unconditionally (not only when
+`hashChanged` — a tags-only edit needs the same protection) and throws
+`ConflictException` on `"conflict"`. `reindex()`, which never passes an
+`expectedUpdatedAt`, can't actually hit that branch, but the repository's
+return type now includes it either way — its `if (!updated)` guard became
+`if (updated === null || updated === "conflict")`, both narrowing to
+`NotFoundException`, with a comment explaining the second arm is
+unreachable in practice and only there for the type checker.
+
+apps/web: `document-form.tsx`'s `handleSave` now sends
+`expectedUpdatedAt` (from `lastSyncedDocument.updatedAt` — the version the
+draft was actually built from, already tracked for the unrelated
+background-resync guard) on every update. A 409 shows a clear toast and
+deliberately does NOT touch `draft`/`original`: the user's own
+in-progress edit must not be silently discarded, and — unlike a
+*successful* save's `mergeServerSnapshot` (D6.16), where the fetched
+snapshot is this draft's own confirmed result — a document fetched after a
+409 is someone ELSE's write, so adopting any of its fields into the draft
+under the "unchanged since submission" rule would just relocate the
+lost-update problem onto whichever field happens to look untouched. Only
+the version token itself refreshes (via a plain `queryClient.fetchQuery`
+for the document, so the user's next explicit Save — an informed,
+deliberate overwrite; they were just told about the conflict — has a real
+chance of succeeding instead of 409ing on the same stale value forever.
+Reading that refreshed value from state directly inside `handleSave` would
+have been silently wrong: `handleSave` is also invoked from the Cmd/Ctrl+S
+keydown listener, which is wired up once in an empty-deps effect and so
+closes over whatever `handleSave` looked like at mount — exactly the
+staleness `draftRef` already exists to route around for the draft itself.
+Mirrored the same pattern with a new `expectedUpdatedAtRef` rather than
+reading `conflictUpdatedAt`/`lastSyncedDocument` state directly.
+`use-save-document.ts`'s optimistic `onMutate` update now picks out only
+`title`/`content`/`tags` from `values` rather than spreading the whole
+object onto the cached `DocumentDetail` — `expectedUpdatedAt` is a request
+parameter, not a document field, and `DocumentDetail` has no such
+property.
+
+Verified: `apps/api/test/documents.e2e-spec.ts` gained a new e2e case
+against the real Postgres+RLS+PostgREST stack (Gate 3) — creates a
+document, saves it with the correct `expectedUpdatedAt` (succeeds, returns
+a bumped `updatedAt`), then replays a second save with the now-stale
+ORIGINAL `expectedUpdatedAt` (as if a second tab had loaded the document
+before the first tab's edit landed) and asserts 409 with `code: "conflict"`,
+that the first edit's content is still intact, and that retrying with the
+now-current `updatedAt` succeeds. A second block proves the check applies
+to a tags-only edit too (no `content_hash` change involved), and a third
+test confirms a nonexistent document still 404s, never 409s, even when
+`expectedUpdatedAt` is supplied. Proven non-vacuous per this project's
+usual discipline: `git stash`-ed `documents.repository.ts` and
+`documents.service.ts` (keeping the schema and test changes) and re-ran
+Gate 3 — the new test failed exactly as expected (`expected 409, got 200`)
+against the pre-fix read-then-write code, then `git stash pop` restored
+the fix and the full suite (28/28) passed again. Full pipeline
+(typecheck/lint, 65 unit tests, 28 Gate 3 e2e tests) and the full Gate 6
+Playwright suite (2/2, including the existing document-editor smoke test,
+which exercises `document-form.tsx`'s save path unchanged) all re-ran
+clean after restoring the fix.

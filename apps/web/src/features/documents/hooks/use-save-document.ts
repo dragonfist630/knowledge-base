@@ -54,9 +54,17 @@ export function useSaveDocument() {
       });
 
       if (id && previousDetail) {
+        // `values` may carry `expectedUpdatedAt` (DocumentUpdate, D9.12) —
+        // that's a request parameter for the optimistic-concurrency check,
+        // not a document field, so only the actual editable fields are
+        // picked out here rather than spreading all of `values` onto the
+        // cached DocumentDetail (which has no `expectedUpdatedAt` of its
+        // own).
         const optimistic: DocumentDetail = {
           ...previousDetail,
-          ...values,
+          ...(values.title !== undefined ? { title: values.title } : {}),
+          ...(values.content !== undefined ? { content: values.content } : {}),
+          ...(values.tags !== undefined ? { tags: values.tags } : {}),
           indexStatus: values.content !== undefined ? "pending" : previousDetail.indexStatus,
           updatedAt: new Date().toISOString(),
         };

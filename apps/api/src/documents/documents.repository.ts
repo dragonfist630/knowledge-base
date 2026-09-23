@@ -149,14 +149,43 @@ export class DocumentsRepository {
     return toDetail(data);
   }
 
+  /**
+   * `expectedUpdatedAt`, when given, makes this an optimistic-concurrency
+   * write: the update's own WHERE clause requires `updated_at` to still
+   * match what the caller last read, so a save that raced another one
+   * (same document, both started from the same snapshot) can never
+   * silently clobber the other — see documents.service.ts's update() and
+   * docs/DECISIONS.md D9.12. `updated_at` is trigger-maintained
+   * (set_documents_updated_at, supabase/migrations) and already returned
+   * to every client via DocumentDetail/DocumentSummary, so this needs no
+   * new column.
+   *
+   * A conditional update affecting 0 rows is ambiguous by itself — the id
+   * might not exist at all, or it might exist with a DIFFERENT
+   * updated_at (i.e. someone else's write already landed). Only in that
+   * ambiguous case (and only then — the common paths take one round
+   * trip, same as before) this runs one extra existence check to tell
+   * the two apart, and returns the literal `"conflict"` for the second
+   * one so the caller can map it to 409 rather than a misleading 404.
+   */
   async update(
     db: SupabaseClient<Database>,
     id: string,
     values: Database["public"]["Tables"]["documents"]["Update"],
-  ): Promise<DocumentDetail | null> {
-    const { data, error } = await db.from("documents").update(values).eq("id", id).select(DETAIL_COLUMNS).maybeSingle();
+    expectedUpdatedAt?: string,
+  ): Promise<DocumentDetail | null | "conflict"> {
+    let query = db.from("documents").update(values).eq("id", id);
+    if (expectedUpdatedAt !== undefined) {
+      query = query.eq("updated_at", expectedUpdatedAt);
+    }
+    const { data, error } = await query.select(DETAIL_COLUMNS).maybeSingle();
     if (error) throw error;
-    return data ? toDetail(data) : null;
+    if (data) return toDetail(data);
+    if (expectedUpdatedAt === undefined) return null;
+
+    const stillExists = await db.from("documents").select("id").eq("id", id).maybeSingle();
+    if (stillExists.error) throw stillExists.error;
+    return stillExists.data ? "conflict" : null;
   }
 
   async delete(db: SupabaseClient<Database>, id: string): Promise<boolean> {

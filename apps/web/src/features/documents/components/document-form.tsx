@@ -3,11 +3,12 @@
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
+import { useQueryClient } from "@tanstack/react-query";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import { MessageSquareIcon, Trash2Icon } from "lucide-react";
-import type { DocumentDetail } from "@kb/shared";
+import { DocumentDetailSchema, type DocumentDetail } from "@kb/shared";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -29,8 +30,10 @@ import { IndexStatusBadge } from "@/features/documents/components/index-status-b
 import { TagInput } from "@/features/documents/components/tag-input";
 import { mergeServerSnapshot } from "@/features/documents/draft-merge.mjs";
 import { useDeleteDocument } from "@/features/documents/hooks/use-delete-document";
+import { documentsKeys } from "@/features/documents/hooks/use-documents";
 import { useReindexDocument } from "@/features/documents/hooks/use-reindex-document";
 import { useSaveDocument } from "@/features/documents/hooks/use-save-document";
+import { apiFetch } from "@/lib/api/client";
 import { ApiError } from "@/lib/api/error";
 
 interface DraftState {
@@ -69,10 +72,18 @@ export function DocumentForm({
   highlightRange?: [number, number];
 }) {
   const router = useRouter();
+  const queryClient = useQueryClient();
   const [original, setOriginal] = useState<DraftState>(() => snapshotOf(document));
   const [draft, setDraft] = useState<DraftState>(() => snapshotOf(document));
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const dirty = JSON.stringify(draft) !== JSON.stringify(original);
+
+  // The `updatedAt` a save should be conditioned on (D9.12): normally
+  // that's simply `lastSyncedDocument?.updatedAt` below (the version this
+  // draft was actually built from), but a 409 needs to override it —
+  // see the catch block in handleSave for why a plain resync isn't safe
+  // there. `undefined` here means "defer to lastSyncedDocument".
+  const [conflictUpdatedAt, setConflictUpdatedAt] = useState<string>();
 
   const save = useSaveDocument();
   const deleteDoc = useDeleteDocument();
@@ -106,6 +117,20 @@ export function DocumentForm({
   const draftRef = useRef(draft);
   draftRef.current = draft;
   const savingRef = useRef(false);
+
+  // Mirrors conflictUpdatedAt ?? lastSyncedDocument?.updatedAt into a ref
+  // for the same reason draftRef exists: handleSave is also called from
+  // the Cmd/Ctrl+S keydown listener below, which is registered once (an
+  // empty-deps effect) and so closes over whatever handleSave looked like
+  // at mount — reading these two state values directly inside handleSave
+  // would silently use their STALE, mount-time values from that path
+  // (e.g. always retrying with the pre-conflict expectedUpdatedAt after a
+  // 409, even once conflictUpdatedAt has since been refreshed), while the
+  // Save button's own onClick (a fresh closure every render) would see
+  // the current values just fine — a divergence that would be easy to
+  // miss in testing if it isn't routed around here.
+  const expectedUpdatedAtRef = useRef<string | undefined>(conflictUpdatedAt ?? lastSyncedDocument?.updatedAt);
+  expectedUpdatedAtRef.current = conflictUpdatedAt ?? lastSyncedDocument?.updatedAt;
 
   useEffect(() => {
     if (!highlightRange || !document) return;
@@ -143,7 +168,8 @@ export function DocumentForm({
     }
     savingRef.current = true;
     try {
-      const saved = await save.mutateAsync({ id: documentId, values: current });
+      const values = documentId ? { ...current, expectedUpdatedAt: expectedUpdatedAtRef.current } : current;
+      const saved = await save.mutateAsync({ id: documentId, values });
       const savedSnapshot = snapshotOf(saved);
       setOriginal(savedSnapshot);
       // Not `setDraft(savedSnapshot)`: the request was in flight for a real
@@ -153,12 +179,43 @@ export function DocumentForm({
       // flagged dirty against the new `original` baseline above. See
       // docs/DECISIONS.md Phase 6, D6.16.
       setDraft((live) => mergeServerSnapshot(current, savedSnapshot, live));
+      setConflictUpdatedAt(undefined);
       toast.success("Document saved.");
       if (!documentId) {
         router.replace(`/documents/${saved.id}`);
       }
     } catch (error) {
-      toast.error(error instanceof ApiError ? error.message : "Failed to save document.");
+      if (error instanceof ApiError && error.status === 409 && documentId) {
+        // Someone else's save landed after this draft's baseline was
+        // read (D9.12) — this save was correctly refused rather than
+        // silently overwriting their edit, so nothing here touches
+        // `draft`/`original`: the user's own in-progress edit must not
+        // be discarded, and neither can the OTHER person's content be
+        // pulled in as a "merge" — unlike a successful save's
+        // mergeServerSnapshot (D6.16), `fresh` below is someone else's
+        // write, not this draft's own confirmed result, so silently
+        // adopting any of its fields would just move the lost-update
+        // problem onto whichever field happens to look "unchanged".
+        // Only the version token itself is refreshed, so the user's
+        // next explicit Save (an informed, deliberate overwrite — they
+        // were just told this) has a real chance of succeeding instead
+        // of 409ing again on the same stale value.
+        toast.error(
+          "This document was changed elsewhere since you last loaded it. Your edits haven't been saved — reload the page to review the latest version, or press Save again to overwrite it.",
+        );
+        try {
+          const fresh = await queryClient.fetchQuery({
+            queryKey: documentsKeys.detail(documentId),
+            queryFn: () => apiFetch(`/documents/${documentId}`, DocumentDetailSchema),
+          });
+          setConflictUpdatedAt(fresh.updatedAt);
+        } catch {
+          // Best effort — if this also fails, the next Save attempt just
+          // 409s again with the same clear message, no worse off.
+        }
+      } else {
+        toast.error(error instanceof ApiError ? error.message : "Failed to save document.");
+      }
     } finally {
       savingRef.current = false;
     }

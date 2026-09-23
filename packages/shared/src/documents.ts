@@ -58,6 +58,15 @@ export const DocumentUpdateSchema = z
     title: trimmedTitle.optional(),
     content: content.optional(),
     tags: tagsWithoutDefault.optional(),
+    // Optional on purpose (see docs/DECISIONS.md D9.12): a caller that
+    // sends it gets an optimistic-concurrency check — apps/api 409s
+    // instead of silently overwriting someone else's more recent edit —
+    // and a caller that omits it (an older client, or a script) keeps the
+    // previous last-write-wins behavior. It's the `updatedAt` from
+    // whichever DocumentDetail/DocumentSummary the edit was made against;
+    // every read already carries that field, so no separate "fetch a
+    // version token" step is needed before editing.
+    expectedUpdatedAt: z.string().optional(),
   })
   .refine((value) => value.title !== undefined || value.content !== undefined || value.tags !== undefined, {
     message: "at least one of title, content, or tags is required",
