@@ -9,7 +9,7 @@ import type { ApiEnv } from "../config/env.js";
 // rather than through Nest's DI container, so there's no design:paramtypes
 // concern (see D3.3) to keep these as value imports.
 import type { UsageRepository } from "../common/usage.repository.js";
-import type { MatchedChunk } from "./retrieval.repository.js";
+import type { DocumentContent, MatchedChunk } from "./retrieval.repository.js";
 import type { RetrievalRepository } from "./retrieval.repository.js";
 import { RetrievalService } from "./retrieval.service.js";
 
@@ -57,6 +57,7 @@ function chunk(overrides: Partial<MatchedChunk> = {}): MatchedChunk {
     content: "Some chunk content.",
     charStart: 0,
     charEnd: 20,
+    contentHash: "hash-1",
     similarity: 0.8,
     textRank: 0,
     score: 0.5,
@@ -67,7 +68,7 @@ function chunk(overrides: Partial<MatchedChunk> = {}): MatchedChunk {
 function makeRepository(rows: MatchedChunk[], overrides: Partial<Record<keyof RetrievalRepository, unknown>> = {}): RetrievalRepository {
   return {
     matchDocumentChunks: vi.fn(async () => rows),
-    findContentByIds: vi.fn(async () => new Map<string, string>()),
+    findContentByIds: vi.fn(async () => new Map<string, DocumentContent>()),
     ...overrides,
   } as unknown as RetrievalRepository;
 }
@@ -202,12 +203,12 @@ describe("RetrievalService — embedding + RPC call shape", () => {
 describe("RetrievalService — near-duplicate (overlap-adjacent) merging", () => {
   it("merges consecutive chunk_index rows from the same document into one source with combined offsets", async () => {
     const rows: MatchedChunk[] = [
-      chunk({ chunkId: "c0", chunkIndex: 0, charStart: 0, charEnd: 100, content: "chunk 0 (unused post-merge)", score: 0.9 }),
-      chunk({ chunkId: "c1", chunkIndex: 1, charStart: 70, charEnd: 180, content: "chunk 1 (unused post-merge)", score: 0.7 }),
+      chunk({ chunkId: "c0", chunkIndex: 0, charStart: 0, charEnd: 100, content: "chunk 0 (unused post-merge)", contentHash: "hash-fresh", score: 0.9 }),
+      chunk({ chunkId: "c1", chunkIndex: 1, charStart: 70, charEnd: 180, content: "chunk 1 (unused post-merge)", contentHash: "hash-fresh", score: 0.7 }),
     ];
     const fullDocument = "x".repeat(180);
     const repository = makeRepository(rows, {
-      findContentByIds: vi.fn(async () => new Map([["doc-1", fullDocument]])),
+      findContentByIds: vi.fn(async () => new Map([["doc-1", { content: fullDocument, contentHash: "hash-fresh" }]])),
     });
     const service = new RetrievalService(FAKE_ENV, makeChatModel(), makeEmbeddingModel(), repository, makeUsageRepository());
 
@@ -286,10 +287,10 @@ describe("RetrievalService — near-duplicate (overlap-adjacent) merging", () =>
     expect(b.chunkIndex).toBe(a.chunkIndex + 1); // genuinely index-adjacent
 
     const rows: MatchedChunk[] = [
-      chunk({ chunkId: "chunk-a", documentId: "doc-1", documentTitle: title, chunkIndex: a.chunkIndex, headingPath: a.headingPath, content: a.content, charStart: a.charStart, charEnd: a.charEnd, score: 0.9 }),
-      chunk({ chunkId: "chunk-b", documentId: "doc-1", documentTitle: title, chunkIndex: b.chunkIndex, headingPath: b.headingPath, content: b.content, charStart: b.charStart, charEnd: b.charEnd, score: 0.85 }),
+      chunk({ chunkId: "chunk-a", documentId: "doc-1", documentTitle: title, chunkIndex: a.chunkIndex, headingPath: a.headingPath, content: a.content, charStart: a.charStart, charEnd: a.charEnd, contentHash: "hash-fresh", score: 0.9 }),
+      chunk({ chunkId: "chunk-b", documentId: "doc-1", documentTitle: title, chunkIndex: b.chunkIndex, headingPath: b.headingPath, content: b.content, charStart: b.charStart, charEnd: b.charEnd, contentHash: "hash-fresh", score: 0.85 }),
     ];
-    const repository = makeRepository(rows, { findContentByIds: vi.fn(async () => new Map([["doc-1", content]])) });
+    const repository = makeRepository(rows, { findContentByIds: vi.fn(async () => new Map([["doc-1", { content, contentHash: "hash-fresh" }]])) });
     const service = new RetrievalService(FAKE_ENV, makeChatModel(), makeEmbeddingModel(), repository, makeUsageRepository());
 
     const result = await service.retrieve(FAKE_DB, { question: "q", history: [] }, "conv-1");
@@ -312,6 +313,37 @@ describe("RetrievalService — near-duplicate (overlap-adjacent) merging", () =>
 
     expect(repository.findContentByIds).toHaveBeenCalledWith(FAKE_DB, []);
     expect(result.sources[0]?.content).toBe("original chunk content");
+  });
+
+  it("D9.11: falls back to the chunk's own content, not a corrupted re-slice, when the document was edited between the RPC call and the re-fetch", async () => {
+    // The matched chunks (and their char offsets) were computed against
+    // "hash-old"'s layout. By the time findContentByIds runs, imagine an
+    // edit has already landed: documents.content_hash is now "hash-new"
+    // and .content is a DIFFERENT string — completely unrelated text that
+    // just happens to be exactly as long. Re-slicing it with the old
+    // offsets would silently splice in this wrong text ("REPLACEMENT..."
+    // at [0,180)) as if it were a verbatim quote from the matched
+    // document. The fix must detect the content_hash mismatch and keep
+    // the merge step's own fallback content instead.
+    const rows: MatchedChunk[] = [
+      chunk({ chunkId: "c0", chunkIndex: 0, charStart: 0, charEnd: 100, content: "chunk 0 own content (the safe fallback)", contentHash: "hash-old", score: 0.9 }),
+      chunk({ chunkId: "c1", chunkIndex: 1, charStart: 70, charEnd: 180, content: "chunk 1 own content (unused post-merge)", contentHash: "hash-old", score: 0.7 }),
+    ];
+    const differentDocumentNowOnDisk = "REPLACEMENT TEXT FROM A NEWER EDIT, UNRELATED TO WHAT WAS MATCHED".padEnd(180, ".");
+    const repository = makeRepository(rows, {
+      findContentByIds: vi.fn(async () => new Map([["doc-1", { content: differentDocumentNowOnDisk, contentHash: "hash-new" }]])),
+    });
+    const service = new RetrievalService(FAKE_ENV, makeChatModel(), makeEmbeddingModel(), repository, makeUsageRepository());
+
+    const result = await service.retrieve(FAKE_DB, { question: "q", history: [] }, "conv-1");
+
+    expect(result.sources).toHaveLength(1);
+    // Must NOT contain the newer document's text — that would be the
+    // exact corruption this fix prevents.
+    expect(result.sources[0]?.content).not.toContain("REPLACEMENT TEXT");
+    // Falls back to the first chunk's own, un-re-sliced content — stale
+    // for a multi-chunk block, but never wrong.
+    expect(result.sources[0]?.content).toBe("chunk 0 own content (the safe fallback)");
   });
 });
 

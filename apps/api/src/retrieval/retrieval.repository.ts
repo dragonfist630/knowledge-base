@@ -21,9 +21,17 @@ export interface MatchedChunk {
   content: string;
   charStart: number;
   charEnd: number;
+  /** The document_chunks row's own content_hash — the content this chunk (and its char offsets) were actually produced from. See RetrievalService.packContext and docs/DECISIONS.md D9.11 for why the caller needs this. */
+  contentHash: string;
   similarity: number;
   textRank: number;
   score: number;
+}
+
+/** A document's current `content` plus the `content_hash` it was read alongside — see RetrievalRepository.findContentByIds. */
+export interface DocumentContent {
+  content: string;
+  contentHash: string;
 }
 
 /**
@@ -57,17 +65,33 @@ export class RetrievalRepository {
       content: row.content,
       charStart: row.char_start,
       charEnd: row.char_end,
+      contentHash: row.content_hash,
       similarity: row.similarity,
       textRank: row.text_rank,
       score: row.score,
     }));
   }
 
-  /** Full `content` for a set of documents, keyed by id — only called for documents where RetrievalService actually needs to re-slice a merged span; RLS means this can only ever return the requesting user's own documents. */
-  async findContentByIds(db: SupabaseClient<Database>, documentIds: string[]): Promise<Map<string, string>> {
+  /**
+   * Full `content` for a set of documents, keyed by id, alongside each
+   * one's CURRENT `content_hash` — only called for documents where
+   * RetrievalService actually needs to re-slice a merged span; RLS means
+   * this can only ever return the requesting user's own documents.
+   *
+   * The `content_hash` is what lets the caller detect the race this read
+   * is exposed to: it runs moments after matchDocumentChunks's own RPC
+   * call, in a separate round trip, so a save landing in that window (the
+   * document's `content_hash` is bumped synchronously by
+   * documents.service.ts's `update()`, well before any reindex that would
+   * produce chunks matching the NEW content) means this read can return
+   * content whose layout no longer matches the char offsets the matched
+   * chunk was actually computed against. See RetrievalService.packContext
+   * and docs/DECISIONS.md D9.11.
+   */
+  async findContentByIds(db: SupabaseClient<Database>, documentIds: string[]): Promise<Map<string, DocumentContent>> {
     if (documentIds.length === 0) return new Map();
-    const { data, error } = await db.from("documents").select("id, content").in("id", documentIds);
+    const { data, error } = await db.from("documents").select("id, content, content_hash").in("id", documentIds);
     if (error) throw error;
-    return new Map((data ?? []).map((row) => [row.id, row.content]));
+    return new Map((data ?? []).map((row) => [row.id, { content: row.content, contentHash: row.content_hash }]));
   }
 }

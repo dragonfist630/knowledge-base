@@ -2970,3 +2970,72 @@ the then-unfixed desync) — this is now the regression guard for D9.7
 itself, not just a workaround to avoid tripping over it. Full pipeline
 (typecheck/lint/test/build) and the full Gate 6 Playwright suite re-ran
 clean after this fix.
+
+### D9.11 — Closing the retrieval TOCTOU race D9.5 deferred
+
+D9.5 flagged, but deliberately left open, a race in
+`retrieval.repository.ts`'s `findContentByIds`: it selects a document's
+current `content` with no freshness check, so a chunk matched by
+`matchDocumentChunks`'s RPC call can be stale by the time
+`retrieval.service.ts`'s `packContext` re-fetches the full document a
+moment later to re-slice a merged block. D9.5 deferred it as needing "a
+content-hash check added to the `match_document_chunks` SQL RPC itself" —
+that infrastructure turned out to already exist (D6.15, Phase 6, added
+exactly that column and a freshness filter to the RPC's own read), just
+not exposed to the caller, so this was smaller than it looked once
+`packages/shared`'s generated types and the migration history were
+actually read rather than assumed from the deferred note alone.
+
+D6.15 closed the *wider* version of this problem — `document_chunks` now
+carries the `content_hash` it was chunked from, and `match_document_chunks`
+only returns chunks whose hash still matches `documents.content_hash` at
+RPC time, so a chunk orphaned by an unfinished or failed reindex was never
+served. What D6.15 didn't close: `matchDocumentChunks`'s RPC call and
+`findContentByIds`'s re-fetch are two separate round trips within the same
+request. A chunk can be perfectly fresh at the moment the RPC runs and
+still be stale by the time the second read happens a few milliseconds
+later, if a save (and the synchronous `content_hash` bump
+`documents.service.ts`'s `update()` makes well before any reindex that
+would produce matching chunks even starts) lands in that narrow window —
+`findContentByIds` would then return the NEW content, sliced with offsets
+that were only ever valid against the OLD content's layout, corrupting the
+source text exactly the way D6.15 already prevented at the RPC's own read.
+
+Fixed by giving the caller what it needs to detect this itself:
+`match_document_chunks` now also returns each matched chunk's own
+`content_hash` in its output (previously computed and used internally for
+D6.15's join, never returned) — a new migration
+(`20260923003700_expose_chunk_content_hash.sql`; Postgres won't
+`CREATE OR REPLACE` a function whose `RETURNS TABLE` column list changes,
+so this one explicitly `DROP FUNCTION`s the old 6-argument signature
+first, same arguments, one more output column). `findContentByIds` now
+also returns each document's current `content_hash` alongside its
+`content`. `packContext` only re-slices a merged block when the two
+match; a mismatch (or a vanished document, the pre-existing case) falls
+back to the block's own already-accumulated content — the first chunk's
+raw `content`, un-re-sliced, which is stale/incomplete for a multi-chunk
+block but, critically, never corrupted.
+
+Verified against a real Postgres 16 + pgvector instance, not just read:
+applied the new migration to a scratch database and confirmed
+`match_document_chunks` returns the matched chunk's real `content_hash`;
+separately confirmed D6.15's own freshness guarantee (a stale chunk still
+returns 0 rows) survived the function being dropped and recreated.
+`supabase/tests/match_document_chunks.test.sql` gained a ninth pgTAP case
+asserting the new output column; proven non-vacuous by running the whole
+suite with only D6.15's migration applied, where it fails outright
+(`column "content_hash" does not exist`) rather than passing vacuously.
+`retrieval.service.spec.ts` gained a new unit test simulating the exact
+race (a merged block matched against `content_hash: "hash-old"`,
+`findContentByIds` returning different, unrelated text stamped
+`"hash-new"`) and asserting the source never contains that unrelated
+text; proven non-vacuous two ways — reverting the whole fix throws a
+`TypeError` (the interface itself changed shape), and, more precisely,
+disabling only the `content_hash` comparison while keeping every type
+change makes the test fail by actually producing the corrupted text
+(`"REPLACEMENT TEXT..."`) in the source, the exact failure mode this fix
+prevents. `packages/shared/src/database.types.ts` and its built `dist/`
+(apps/api imports the compiled package, not the source — typecheck
+surfaced this immediately as a stale-type error) both updated. Full
+pipeline and the full Gate 6 Playwright suite (which applies every
+migration fresh, including this one) re-ran clean.

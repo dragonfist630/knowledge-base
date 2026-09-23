@@ -63,6 +63,8 @@ interface MergedBlock {
   content: string;
   charStart: number;
   charEnd: number;
+  /** All chunks matched for one document in a single RPC call always share one content_hash — replace_document_chunks always stamps a full delete+reinsert per document with the same p_content_hash, never a partial update — so this is just the first chunk's own value, same as `content`/`headingPath` before any merge-time update. See packContext for what it's used for. */
+  contentHash: string;
   similarity: number;
   score: number;
 }
@@ -210,14 +212,27 @@ export class RetrievalService {
     const documentContents = await this.repository.findContentByIds(db, [...new Set(needsRefetch)]);
     for (const block of blocks) {
       if (block.chunkIds.length <= 1) continue;
-      const fullContent = documentContents.get(block.documentId);
-      if (fullContent !== undefined) {
-        block.content = fullContent.slice(block.charStart, block.charEnd);
+      const fresh = documentContents.get(block.documentId);
+      // Re-slice only when this read's content_hash still matches the one
+      // the matched chunk (and its char offsets) were actually computed
+      // from. Without this check, a save landing between matchDocumentChunks's
+      // RPC call and this read — content_hash is bumped synchronously by
+      // documents.service.ts's update(), well before the background
+      // reindex that would produce chunks matching the new content even
+      // starts — would silently splice the WRONG span of the new content
+      // in, using offsets that described a completely different layout,
+      // and present it to the LLM (and the user, via citations) as a
+      // verbatim quote. Falling back to whatever content the merge step
+      // already accumulated (the first chunk's own, un-re-sliced content —
+      // stale/incomplete for a multi-chunk block, but never corrupted) is
+      // the same "don't take down the whole turn" fallback this code
+      // already used for a document that vanished outright — a hash
+      // mismatch gets the identical treatment, not a special case. See
+      // docs/DECISIONS.md D9.11; D6.15 covers the analogous race one level
+      // up, in matchDocumentChunks's own RPC read.
+      if (fresh !== undefined && fresh.contentHash === block.contentHash) {
+        block.content = fresh.content.slice(block.charStart, block.charEnd);
       }
-      // If the document vanished between the RPC call and this read (e.g.
-      // deleted mid-request), fall back to whatever content the merge step
-      // already accumulated rather than throwing — a missing re-slice
-      // shouldn't take down the whole chat turn.
     }
 
     const sources: Source[] = [];
@@ -278,6 +293,7 @@ export class RetrievalService {
           content: row.content,
           charStart: row.charStart,
           charEnd: row.charEnd,
+          contentHash: row.contentHash,
           similarity: row.similarity,
           score: row.score,
         };

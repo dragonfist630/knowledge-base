@@ -273,6 +273,7 @@ export type Database = {
           chunk_id: string
           chunk_index: number
           content: string
+          content_hash: string
           document_id: string
           document_title: string
           heading_path: string

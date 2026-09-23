@@ -15,9 +15,16 @@
 -- retrieval.service.ts re-slices merged blocks out of the document's
 -- CURRENT content using that chunk's char offsets, which are only valid
 -- against the content it was actually chunked from.
+--
+-- And D9.11 (docs/DECISIONS.md Phase 9): match_document_chunks now also
+-- RETURNS each matched chunk's own content_hash, so retrieval.service.ts
+-- can detect the narrower race D6.15 doesn't close — a save landing
+-- between this RPC call and packContext's own separate read of the
+-- document's current content, which would otherwise re-slice the NEW
+-- content using offsets that were only ever valid against the OLD one.
 
 begin;
-select plan(8);
+select plan(9);
 
 insert into auth.users (id, email) values
   ('00000000-0000-0000-0000-00000000000a', 'user-a@example.com'),
@@ -118,6 +125,20 @@ select is(
   )),
   1::bigint,
   'no filters at all still returns the user''s own matching chunk'
+);
+
+-- D9.11: the RPC's own output includes each matched chunk's content_hash
+-- (not just documents/document_chunks internally, where D6.15's freshness
+-- filter already used it) — retrieval.service.ts's packContext needs this
+-- to detect a save landing after this RPC call but before its own,
+-- separate re-fetch of the document's current content.
+select is(
+  (select content_hash from public.match_document_chunks(
+    array_fill(0.01, array[1536])::extensions.vector, 'hello', 8, 0.25,
+    array['00000000-0000-0000-0000-0000000000d1']::uuid[]
+  )),
+  'hash-a',
+  'match_document_chunks returns the matched chunk''s own content_hash (D9.11)'
 );
 
 -- D6.15: a chunk whose content_hash no longer matches its document's
