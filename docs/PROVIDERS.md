@@ -183,12 +183,12 @@ begin;
 
 -- Existing HNSW index is built for the old dimension; drop it before the
 -- column type change, it will need to be rebuilt for the new one anyway.
-drop index if exists document_chunks_embedding_idx;
+drop index if exists document_chunks_embedding_hnsw;
 
 alter table public.document_chunks
   alter column embedding type vector(1024); -- new dimension here
 
-create index document_chunks_embedding_idx
+create index document_chunks_embedding_hnsw
   on public.document_chunks
   using hnsw (embedding vector_cosine_ops);
 

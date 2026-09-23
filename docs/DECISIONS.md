@@ -2868,3 +2868,18 @@ conversation-switching test was written to use a hard `page.goto` for its
 specifically to keep it scoped to D9.6's fix (which it does verify) rather
 than tripping over this separate, deferred bug.
 
+### D9.8 — `docs/PROVIDERS.md`: wrong index name in the re-embedding migration template
+
+Agent 4's docs-vs-code pass caught that the dimension-change migration
+template (the `alter column embedding type vector(...)` example) dropped
+and recreated an index named `document_chunks_embedding_idx` — but the
+actual index, per `supabase/migrations/20260916233538_init.sql` lines
+54-55, is named `document_chunks_embedding_hnsw`. A reader copy-pasting
+the template's `drop index if exists document_chunks_embedding_idx` would
+silently no-op (the real index is never dropped) and then fail on `create
+index document_chunks_embedding_idx` colliding with nothing — or, if
+they'd renamed their own index to match the doc at some point, would
+succeed while leaving the *actual* differently-named index behind,
+un-rebuilt for the new dimension. Both occurrences corrected to
+`document_chunks_embedding_hnsw`.
+
