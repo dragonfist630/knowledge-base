@@ -72,6 +72,18 @@ const EnvSchema = z.object({
   THROTTLE_PREAUTH_TTL_MS: z.preprocess(emptyToUndefined, z.coerce.number().int().positive().optional()).default(
     60_000,
   ),
+  /**
+   * Optional. Unset (the default) keeps @nestjs/throttler's built-in
+   * in-memory counters — correct for a single apps/api process, but each
+   * additional replica then keeps its own counter (see docs/SCALING.md
+   * item 2: effective limit becomes configured limit × instance count).
+   * Set this to point every replica at the same Redis instance instead —
+   * see RedisThrottlerStorage (apps/api/src/common/redis-throttler-storage.ts)
+   * and docs/DECISIONS.md D9.15. Same "sane default, real infrastructure
+   * opt-in" posture as AI_CHAT_PROVIDER/AI_EMBEDDING_PROVIDER defaulting to
+   * mock.
+   */
+  REDIS_URL: optionalString,
 });
 
 export type ApiEnv = z.infer<typeof EnvSchema>;

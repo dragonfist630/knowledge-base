@@ -138,7 +138,10 @@ docs/AI_WORKFLOW.md    a running log of what was asked of the AI each phase
 pnpm lint            # turbo lint across every package
 pnpm typecheck       # turbo typecheck across every package
 pnpm build           # turbo build across every package
-pnpm test            # turbo test across every package (unit/pure-logic tests)
+pnpm test            # turbo test across every package (unit/pure-logic tests) — needs a
+                     # reachable local Redis on 127.0.0.1:6379 (no auth/schema needed) for
+                     # apps/api's RedisThrottlerStorage spec (D9.15); everything else in
+                     # this tier is infra-free
 pnpm test:e2e        # Gate 6: a real browser against a real backend — see below
 pnpm check:dev-boot  # boots `pnpm dev` for real and asserts it actually serves a page
 pnpm db:start        # supabase start

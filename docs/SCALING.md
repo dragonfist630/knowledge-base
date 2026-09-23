@@ -63,20 +63,44 @@ scheduled trigger that authenticates as a specific user on a timer — a
 narrower, differently-scoped feature than "a background worker," and one
 this project hasn't needed yet.
 
-## 2. Rate limiting is per-process, not global
+## 2. Rate limiting is per-process, not global — fixed (D9.15), opt-in
 
-`@nestjs/throttler` is configured with no custom storage provider, which
-means it defaults to in-memory counters. With a single `apps/api` process
-this behaves exactly as documented (120 req/min default, 20 req/min for
-chat, per user). The moment you run more than one instance behind a load
-balancer, each instance keeps its own counter — a user's effective limit
-becomes (configured limit) × (instance count), not the configured limit.
-This is silent: nothing would break, the limits would simply stop meaning
-what the config says they mean.
+Updated (D9.15, Phase 9): `@nestjs/throttler` used to be configured with no
+custom storage provider, defaulting to in-memory counters — with a single
+`apps/api` process this behaved exactly as documented (120 req/min default,
+20 req/min for chat, per user), but the moment you ran more than one
+instance behind a load balancer, each instance kept its own counter — a
+user's effective limit became (configured limit) × (instance count), not
+the configured limit. Silent: nothing broke, the limits just stopped
+meaning what the config said they meant.
 
-**The fix**: a shared storage backend for the throttler (Redis is the
-standard choice — `@nest-lab/throttler-storage-redis` or similar) before
-running more than one `apps/api` instance.
+**The fix**: set `REDIS_URL` and every `apps/api` replica shares one set of
+counters instead. `RedisThrottlerStorage`
+(`apps/api/src/common/redis-throttler-storage.ts`) implements
+`@nestjs/throttler`'s own `ThrottlerStorage` interface with a single atomic
+Redis `EVAL` (a fixed-window counter plus a separate block-flag key) —
+hand-rolled against `ioredis` rather than a dependency on
+`@nest-lab/throttler-storage-redis`, whose declared peer range
+(`@nestjs/common`/`@nestjs/core` up to `^11`) doesn't cover this app's
+installed `12.0.3`. See `docs/DECISIONS.md` D9.15 for the full design,
+including why it's a standard fixed-window counter rather than a
+byte-for-byte port of the in-memory implementation's per-hit-decrement
+quirk, and how "two replicas share one limit" was verified against a real
+Redis (not mocked) — two independent `RedisThrottlerStorage` instances
+pointed at the same Redis, proven to enforce one combined limit where two
+independent in-memory `ThrottlerStorageService` instances (the literal
+pre-fix bug) don't.
+
+**Left unset (still the default)**: exactly the old behavior —
+`ThrottlerModule`'s own fallback constructs the built-in in-memory storage,
+same as before D9.15 existed. This is opt-in, not a forced migration,
+because nothing in this repo actually runs more than one `apps/api`
+replica yet (see item 7) — there's no reason to require Redis as a
+prerequisite for local dev or a single-instance deployment. Fails **open**,
+not closed: if Redis is unreachable when `REDIS_URL` is set, a request is
+allowed through and the error is logged, rather than every request being
+rejected or hanging — a rate limiter that's temporarily down is a smaller
+problem than an API that is.
 
 ## 3. Chat streaming holds a long-lived connection on one instance
 
@@ -167,10 +191,13 @@ fixed and can't be by this app's own design: there's still no background
 worker independent of a live request (only request-adjacent claiming —
 see item 1), and, separately and more simply, **no deploy target exists at
 all** — no host, no Kubernetes cluster, no autoscaling group configured to
-actually run more than one `apps/api` replica. The scaling levers item 2
-(shared rate-limit store) and item 3 (long-lived-connection-aware load
-balancing) describe are now safe to exercise from an indexing-correctness
-standpoint, but still have nothing to run them against.
+actually run more than one `apps/api` replica. Item 2 (shared rate-limit
+store) is now actually built, not just theoretically safe — set
+`REDIS_URL` and it's in effect. Item 3 (long-lived-connection-aware load
+balancing) is still a configuration concern for whatever eventually sits in
+front of this app, not something this repo's own code can close. Both are
+ready from a correctness standpoint; there's still nothing to run them
+against.
 
 ## What's already handled well, and doesn't need revisiting for scale
 

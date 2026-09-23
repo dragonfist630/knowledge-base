@@ -10,6 +10,7 @@ import { AuthModule } from "./auth/auth.module.js";
 import { ChatModule } from "./chat/chat.module.js";
 import { HttpExceptionFilter } from "./common/http-exception.filter.js";
 import { PreAuthThrottlerGuard } from "./common/preauth-throttler.guard.js";
+import { RedisThrottlerStorage } from "./common/redis-throttler-storage.js";
 import { RequestIdMiddleware } from "./common/request-id.middleware.js";
 import { UserThrottlerGuard } from "./common/user-throttler.guard.js";
 import { API_ENV, ConfigModule } from "./config/config.module.js";
@@ -51,18 +52,36 @@ import { UsageModule } from "./usage/usage.module.js";
     ThrottlerModule.forRootAsync({
       imports: [ConfigModule],
       inject: [API_ENV],
-      useFactory: (env: ApiEnv) => [
-        { name: "default", ttl: env.THROTTLE_DEFAULT_TTL_MS, limit: env.THROTTLE_DEFAULT_LIMIT },
-        // Applied to POST /chat and /chat/stream via @Throttle({ chat: {} })
-        // (see chat.controller.ts) — registered here since named throttlers
-        // must be declared at the module root, not per-controller.
-        { name: "chat", ttl: env.THROTTLE_CHAT_TTL_MS, limit: env.THROTTLE_CHAT_LIMIT },
-        // Checked by PreAuthThrottlerGuard only (see its own doc comment)
-        // — a per-IP ceiling that runs before AuthGuard, so an
-        // unauthenticated flood can't skip rate limiting entirely just by
-        // never presenting a valid token.
-        { name: "preauth", ttl: env.THROTTLE_PREAUTH_TTL_MS, limit: env.THROTTLE_PREAUTH_LIMIT },
-      ],
+      // The object form (`{ throttlers, storage }`), not the bare-array
+      // form this returned before D9.15 — @nestjs/throttler's own
+      // ThrottlerModuleOptions type only has a `storage` field on the
+      // object form (checked against the installed package's
+      // throttler-module-options.interface.d.ts); the array form has no
+      // way to attach one at all.
+      useFactory: (env: ApiEnv) => ({
+        throttlers: [
+          { name: "default", ttl: env.THROTTLE_DEFAULT_TTL_MS, limit: env.THROTTLE_DEFAULT_LIMIT },
+          // Applied to POST /chat and /chat/stream via @Throttle({ chat: {} })
+          // (see chat.controller.ts) — registered here since named throttlers
+          // must be declared at the module root, not per-controller.
+          { name: "chat", ttl: env.THROTTLE_CHAT_TTL_MS, limit: env.THROTTLE_CHAT_LIMIT },
+          // Checked by PreAuthThrottlerGuard only (see its own doc comment)
+          // — a per-IP ceiling that runs before AuthGuard, so an
+          // unauthenticated flood can't skip rate limiting entirely just by
+          // never presenting a valid token.
+          { name: "preauth", ttl: env.THROTTLE_PREAUTH_TTL_MS, limit: env.THROTTLE_PREAUTH_LIMIT },
+        ],
+        // Unset REDIS_URL (the default) leaves this undefined, and
+        // @nestjs/throttler's own ThrottlerStorageProvider factory falls
+        // back to its built-in in-memory ThrottlerStorageService — the
+        // exact behavior this app had before D9.15. Set it to share rate
+        // -limit state across every apps/api replica instead — see
+        // docs/SCALING.md item 2 and docs/DECISIONS.md D9.15 for why this
+        // is a hand-rolled ioredis storage rather than a third-party
+        // package (RedisThrottlerStorage's own doc comment has the Redis
+        // schema).
+        storage: env.REDIS_URL ? new RedisThrottlerStorage(env.REDIS_URL) : undefined,
+      }),
     }),
     AuthModule,
     AiModule,

@@ -63,10 +63,13 @@ its process gets started. apps/api's `SUPABASE_URL` and
 (validated at boot by `apps/api/src/config/env.ts` — a missing or invalid
 one fails fast with a readable error, not a silent crash or a confusing
 runtime failure three requests later); everything else (`AI_*`, `RAG_*`,
-`THROTTLE_*`, `WEB_ORIGIN`) has a working default, and `AI_CHAT_PROVIDER`/
-`AI_EMBEDDING_PROVIDER` default to `mock`, so the API runs with zero AI
-provider keys configured (see `docs/PROVIDERS.md` to point it at a real
-one). A real deployment should still set `SUPABASE_JWT_SECRET` to nothing
+`THROTTLE_*`, `REDIS_URL`, `WEB_ORIGIN`) has a working default, and
+`AI_CHAT_PROVIDER`/`AI_EMBEDDING_PROVIDER` default to `mock`, so the API
+runs with zero AI provider keys configured (see `docs/PROVIDERS.md` to
+point it at a real one). `REDIS_URL` (D9.15) is unset by default, which
+keeps the rate limiter's in-memory counters — set it only once running more
+than one replica (see below and `docs/SCALING.md` item 2). A real
+deployment should still set `SUPABASE_JWT_SECRET` to nothing
 (leave it unset) unless pointed at a self-hosted Supabase instance — a
 hosted Supabase project's `AuthGuard` verification never touches it (see
 `docs/DECISIONS.md` D3.1); setting it against a hosted project's real
@@ -103,6 +106,11 @@ request (claiming only happens request-adjacent — right after a save, or
 via `resumeStuckIndexing` on a later read), and no orchestrator config
 anywhere in this repo that would actually run `apps/api` at
 `replicas: 2+` — see `docs/SCALING.md` item 1 for both of those in full.
+**Rate limiting is also now multi-replica-safe when configured for it**
+(D9.15): set `REDIS_URL` so every replica shares one counter instead of
+each keeping its own — see `docs/SCALING.md` item 2. Unset, exactly like
+before D9.15: each replica's in-memory counter is only correct for a single
+instance.
 
 **Postgres isn't part of either image.** Both expect a reachable, already
 -migrated Supabase project (hosted, or self-hosted separately) — see the

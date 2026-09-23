@@ -3490,3 +3490,180 @@ either a service-role client (reopening exactly the risk D3.6 was written
 to avoid) or a scheduled external trigger that authenticates as some
 specific user on a timer (a different, and differently-scoped, feature
 than "a background worker").
+
+### D9.15 — A shared, opt-in Redis-backed rate-limit store, closing `docs/SCALING.md` item 2
+
+`docs/SCALING.md` item 2 named the second scaling bottleneck plainly:
+`@nestjs/throttler` was configured with no custom `storage`, so it defaulted
+to its own in-memory counters (`ThrottlerStorageService`). Correct for one
+`apps/api` process; silently wrong the moment a second one ran behind a
+load balancer — each replica keeps its own counter, so a user's effective
+limit becomes (configured limit) × (instance count), not the number
+`THROTTLE_*_LIMIT` actually says. This entry adds `RedisThrottlerStorage`
+and wires it in behind a new optional `REDIS_URL` — set, every replica
+shares one set of counters; unset (still the default), exactly the old
+in-memory behavior, byte-for-byte.
+
+**`@nest-lab/throttler-storage-redis` was the obvious first candidate, and
+was rejected before writing any code.** It's the closest thing to a
+standard answer to "Redis-backed storage for `@nestjs/throttler`" and would
+have meant writing nothing. Checked before assuming it would just work:
+`npm view @nest-lab/throttler-storage-redis peerDependencies` lists
+`@nestjs/common`/`@nestjs/core: ^7.0.0 || ^8.0.0 || ^9.0.0 || ^10.0.0 ||
+^11.0.0` — this app's installed `@nestjs/common`/`@nestjs/core` is
+`12.0.3` (`apps/api/package.json`), outside every one of those ranges. Not
+necessarily broken in practice, but a real, avoidable compatibility risk
+for the one piece of infrastructure specifically responsible for keeping
+the API from being flooded — and `docs/SCALING.md` item 2's own original
+wording ("Redis is the standard choice — `@nest-lab/throttler-storage-redis`
+*or similar*") already left room for this. A hand-rolled `ioredis`-based
+implementation is also consistent with this app's existing pattern of
+owning infrastructure it needs to fully understand rather than trusting a
+thin wrapper around it — `PreAuthThrottlerGuard` (Phase 3) is the same kind
+of choice, one level up the same package's API.
+
+**What `ThrottlerStorage` actually requires.** Read directly from the
+installed package rather than assumed: `ThrottlerStorage.increment(key,
+ttl, limit, blockDuration, throttlerName)` returns a `ThrottlerStorageRecord`
+— `{ totalHits, timeToExpire, isBlocked, timeToBlockExpire }`, with
+`timeToExpire`/`timeToBlockExpire` in **seconds**, confirmed against the
+built-in `ThrottlerStorageService`'s own `getExpirationTime`/
+`getBlockExpirationTime` (`Math.ceil(msRemaining / 1000)` —
+`node_modules/@nestjs/throttler/dist/throttler.service.js`), even though
+`ttl`/`blockDuration` arrive in **milliseconds** (this app's
+`THROTTLE_*_TTL_MS` env vars). `ThrottlerStorageRecord` itself isn't
+exported from the package's public root (`dist/index.d.ts` only re-exports
+`throttler-storage.interface`, which *imports* `ThrottlerStorageRecord` for
+its own signature but never re-exports it) — `redis-throttler-storage.ts`
+redeclares it locally, matching the installed `.d.ts` exactly, rather than
+reaching into the package's internals. Also confirmed directly from
+`throttler.guard.js`: `ThrottlerGuard.generateKey(context, tracker, name)`
+already hashes `(ClassName, HandlerName, throttlerName, tracker)` into each
+storage key — so a storage implementation doesn't need its own
+per-throttler-name namespacing the way the in-memory service's
+`Map<throttlerName, hitCount>`-per-key structure does; each key this
+storage ever sees is already scoped to exactly one throttler.
+
+**The design.** `apps/api/src/common/redis-throttler-storage.ts` is one
+class, one atomic Redis `EVAL` (`INCREMENT_SCRIPT`), two keys per storage
+`key`:
+
+- `throttle:<key>` — a hit counter. `INCR`'d every call; `PEXPIRE`'d only
+  on the very first increment of a window (`totalHits == 1`), so later
+  hits don't keep pushing the window's own expiry back.
+- `throttle:<key>:blocked` — `SET ... PX blockDuration`, set only the
+  moment hits first exceeds `limit`. Its own TTL *is* the remaining block
+  time, so "still blocked" is a single `PTTL`, not a stored timestamp
+  compared against `now()` the way the in-memory implementation does.
+
+This is a standard fixed-window counter, **not** a byte-for-byte port of
+`ThrottlerStorageService`'s per-hit-decrement behavior (one `setTimeout`
+per hit, each decrementing the count individually once *that hit's own*
+ttl elapses — read directly from `throttler.service.js`). That's judged to
+be an implementation detail of the in-memory storage, not part of the
+`ThrottlerStorage` contract, which only promises "at most `limit` hits per
+`ttl` window, then blocked for `blockDuration`" — reproducing the
+per-hit-decrement quirk in Redis would need either a sorted set per key (a
+member per hit, scored by expiry, trimmed by `ZREMRANGEBYSCORE` on every
+call) or a Lua script walking a list — real added complexity for behavior
+nothing in this app, or the guard's own documented contract, depends on.
+
+Both the "check if already blocked" and "increment and maybe block" steps
+run inside the *same* `EVAL` call, which is the actual reason this needs a
+script rather than a few separate `ioredis` calls: two concurrent requests
+for the same key (two `apps/api` replicas, or two in-flight requests from
+the same user) must never both read "this is hit number N" for the same
+N — a `GET`-then-`INCR`-then-maybe-`SET` sequence of separate round trips
+would let exactly that race back in, which is the same class of bug this
+whole class exists to remove.
+
+**Wiring (`app.module.ts`).** `ThrottlerModule.forRootAsync`'s `useFactory`
+used to return a bare array of named throttlers directly. Checked against
+`@nestjs/throttler`'s own `ThrottlerModuleOptions` type
+(`throttler-module-options.interface.d.ts`) before changing anything: the
+`storage` field only exists on the **object** form (`{ throttlers, storage
+}`), not the array form — so this had to change to the object form to
+attach a custom storage at all, not just add a field. `storage:
+env.REDIS_URL ? new RedisThrottlerStorage(env.REDIS_URL) : undefined`;
+when `undefined`, `@nestjs/throttler`'s own `ThrottlerStorageProvider`
+factory (`throttler.providers.js`: `useFactory: (options) => options.storage
+?? new ThrottlerStorageService()`) falls back to the built-in in-memory
+storage itself — this app's code doesn't need to reimplement that
+fallback, only decline to override it.
+
+**Fails open, not closed.** `increment()` wraps the `EVAL` call in a
+try/catch; on any error (Redis unreachable, timed out) it logs and returns
+`{ totalHits: 0, timeToExpire: 0, isBlocked: false, timeToBlockExpire: 0 }`
+— the request is allowed through. The alternative (throwing, or returning
+`isBlocked: true`) would turn a Redis outage into either a 500 on every
+request or every user on every replica being locked out simultaneously,
+the moment `REDIS_URL` is set — a rate limiter that's temporarily down is
+a smaller problem than an API that is. The `ioredis` client is constructed
+with `maxRetriesPerRequest: 1` specifically so a down Redis surfaces as a
+fast rejected promise (caught by the try/catch above) rather than a
+request hanging on `ioredis`'s own default indefinite reconnect/retry
+behavior — verified live (below), not just reasoned about.
+
+**Verification — against real Redis, not mocked, throughout:**
+
+- `apps/api/src/common/redis-throttler-storage.spec.ts` (6 cases) runs
+  against a real local Redis. Basic behavior: hits count up to `limit`
+  then block; a still-blocked key doesn't keep incrementing or extending
+  its own block window; `timeToExpire`/`timeToBlockExpire` come back in
+  seconds, not the milliseconds `ttl`/`blockDuration` were passed in as.
+  Atomicity: 50 concurrent `increment()` calls against one key return 50
+  *distinct* `totalHits` values (1 through 50) — proven non-vacuous by
+  temporarily replacing the atomic `EVAL` with a `GET`-then-delay-then-
+  `SET` sequence (a deliberate race) and re-running: the same test failed
+  (`expected 1 to be 50` — every concurrent caller read the same stale
+  value), confirming the assertion actually exercises the atomicity the
+  Lua script exists for, not just the shape of the return value. Reverted
+  (`diff` against a saved copy confirmed byte-identical) before moving on.
+  Fail-open: pointed at `redis://127.0.0.1:1` (nothing listens there), and
+  `increment()` still resolves — with `isBlocked: false` — rather than
+  throwing or hanging.
+- The actual point of this whole change, proven directly rather than
+  inferred from unit behavior: two independent `RedisThrottlerStorage`
+  instances (simulating two `apps/api` replicas, each constructing its own
+  storage the way `app.module.ts`'s `useFactory` does per-process) pointed
+  at the *same* Redis, hit with the same key, enforce **one combined**
+  limit — 3 calls to "replica A" succeed, then "replica B"'s first call
+  (the 4th against the shared key) blocks, and its remaining calls stay
+  blocked. Run side-by-side against two independent in-memory
+  `ThrottlerStorageService` instances (what two real `apps/api` processes
+  actually have today, each its own Node heap) with the identical call
+  sequence: none of the 6 calls block — the literal bug this item
+  describes, reproduced directly rather than taken on faith, in the same
+  test run that proves the fix.
+- End-to-end, not just at the storage-class level: `pnpm test:e2e`'s
+  existing `app.e2e-spec.ts` (which boots the real `AppModule` via Nest's
+  `TestingModule` + a real HTTP server) re-ran clean with `REDIS_URL`
+  unset — 30/30, confirming the `useFactory`'s switch from the array form
+  to the object form didn't change anything about the default path. A
+  scratch spec (written, run, and deleted before committing — never part
+  of this repo's history) then booted the same real `AppModule` with
+  `REDIS_URL=redis://127.0.0.1:6379` set: `GET /health` still returns
+  `200`, and flooding it past `THROTTLE_PREAUTH_LIMIT` (60) actually
+  returns `429` — with `redis-cli keys 'throttle:*'` afterward showing real
+  keys, confirming Redis (not the in-memory fallback) did the counting.
+- `pnpm typecheck`/`pnpm lint`/`pnpm test` (72/72, up from 66 — the new
+  spec's 6) all clean.
+
+**CI.** `.github/workflows/ci.yml`'s `checks` job (the one running `pnpm
+test`) gets a `redis:7-alpine` service container — the new spec needs a
+reachable Redis, and unlike the Postgres+PostgREST harness `e2e-api`'s job
+uses, a bare Redis needs no schema or auth and starts in under a second,
+so it belongs in the lighter unit-test-tier job rather than pulled into
+Gate 3's heavier one. (This file exists, correct and up to date, in the
+working tree and on the machine it was authored on, but is not yet on
+`origin/main`'s `.github/workflows/ci.yml` — the credential every push in
+this environment goes through lacks the `workflow` OAuth scope GitHub
+requires to update files under `.github/workflows/`, a platform-level
+restriction with no workaround available here. Landing it needs one
+manual step outside this environment: pasting this file's content through
+GitHub's own web UI, which does not have that restriction.)
+
+`docs/SCALING.md` item 2, `docs/DEPLOYMENT.md`'s environment section,
+`.env.example`, and `README.md`'s `pnpm test` prerequisites are all
+updated to describe `REDIS_URL` as optional, its default (unset, in-memory,
+unchanged behavior), and what setting it actually buys.
