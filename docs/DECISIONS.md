@@ -3667,3 +3667,52 @@ GitHub's own web UI, which does not have that restriction.)
 `.env.example`, and `README.md`'s `pnpm test` prerequisites are all
 updated to describe `REDIS_URL` as optional, its default (unset, in-memory,
 unchanged behavior), and what setting it actually buys.
+
+### D9.16 — Investigated a fully free (no-credit-card) local AI stack; documented it, didn't default to it
+
+Prompted by a real deployment concern raised while testing locally:
+OpenAI's API rejects requests with `[rate_limit] openai rate limit
+exceeded` on a brand-new key until a payment method is on file, even at
+trivial volume — not a config bug, just how OpenAI's platform works. That
+raised the natural follow-up: could this app run entirely on providers
+that need no card at all, for local development?
+
+**Groq** turned out to have two separate gotchas beyond "no embeddings
+endpoint" (already documented above). First, its actual available model
+list is account-specific and has changed more than once — `GET
+/v1/models` against a real key returned neither
+`llama-3.3-70b-versatile` nor `llama-3.1-8b-instant` as the app's
+`AI_CHAT_MODEL`, both 404ing with "does not exist or you do not have
+access to it" despite being current in Groq's own docs at the time,
+while `openai/gpt-oss-20b` worked. `docs/PROVIDERS.md`'s Groq snippet is
+left as a starting point, not a guarantee — checking a key's own
+`/v1/models` response before trusting any specific model name avoids
+chasing a config bug that's actually an account/availability issue.
+
+**Ollama** is free and fully local for chat *and* embeddings, but no
+common Ollama embedding model outputs 1536 dimensions
+(`nomic-embed-text` is 768, `mxbai-embed-large`/`bge-m3` are 1024) — the
+exact width `document_chunks.embedding` is fixed to
+(`20260916233538_init.sql`). Following this doc's own existing dimension-
+migration template through for real (drop the HNSW index, alter the
+column type, drop-and-recreate `match_document_chunks` since a parameter
+type change isn't an in-place `create or replace`, wipe now-incompatible
+chunk rows, re-index) confirmed the template works end to end: `pnpm
+ai:check` passed for both a real Groq chat call and a real 768-dimension
+Ollama embedding call, and existing documents re-indexed and answered
+chat questions correctly again after being retried.
+
+**Deliberately not merged as the new default**, and specifically not
+`packages/ai/src/config.ts`'s `REQUIRED_EMBEDDING_DIMENSIONS` or the
+migration file itself. That constant is global, not per-environment — a
+768 default would fail `config.spec.ts`'s own assertion that
+`AI_EMBEDDING_DIMENSIONS != 1536` is rejected, fail
+`supabase/tests/match_document_chunks.test.sql` and
+`rls_isolation.test.sql`'s hard-coded 1536-dimension pgTAP test vectors,
+and contradict every other provider snippet in `docs/PROVIDERS.md`
+(OpenAI, Groq+OpenAI, Together, OpenRouter), all of which assume a
+1536-dimension model and are also the more realistic choice for an
+eventual deployed instance a recruiter would actually use. Documented
+instead as a worked example under `docs/PROVIDERS.md`'s existing
+dimension-migration section, explicit about staying local-only and out
+of commits.

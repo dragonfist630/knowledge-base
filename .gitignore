@@ -21,3 +21,4 @@ apps/api/test/e2e/.runtime.json
 
 # Claude Code's per-machine local settings
 .claude/settings.local.json
+supabase/snippets

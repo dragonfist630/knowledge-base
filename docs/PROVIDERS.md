@@ -215,6 +215,81 @@ Then:
    own validation will reject a mismatch with an `invalid_response`
    `AiError` if the provider returns something else.
 
+### Worked example: a fully free, no-credit-card stack (Groq + Ollama)
+
+Groq's free tier needs no card for chat, but has no embeddings endpoint at
+all (see "Groq" above). Ollama is free and local for both, but its
+embedding models don't produce 1536-dimension vectors, so pairing "Groq for
+chat" with "Ollama for embeddings" means running the dimension migration
+above. This is that migration, concretely, for `nomic-embed-text`
+(768 dimensions) — copy it into a new `supabase/migrations/<timestamp>_*.sql`
+file rather than applying it as a repo-wide default, since it changes
+`REQUIRED_EMBEDDING_DIMENSIONS` for the whole app (see the warning below):
+
+```sql
+begin;
+
+-- Old rows are 1536-dim and incompatible with the new model's embedding
+-- space regardless of column width, so they're wiped rather than converted.
+delete from public.document_chunks;
+
+drop index if exists document_chunks_embedding_hnsw;
+
+alter table public.document_chunks
+  alter column embedding type extensions.vector(768);
+
+create index document_chunks_embedding_hnsw
+  on public.document_chunks
+  using hnsw (embedding extensions.vector_cosine_ops) with (m = 16, ef_construction = 64);
+
+-- query_embedding's type is part of match_document_chunks's signature, so
+-- changing it means dropping the old 6-arg overload first (same reason
+-- 20260923003700_expose_chunk_content_hash.sql did this) and recreating the
+-- function with the same body as that migration, just vector(768) here.
+drop function if exists public.match_document_chunks(extensions.vector, text, int, float, uuid[], text[]);
+
+-- ... recreate match_document_chunks with query_embedding extensions.vector(768)
+-- and the same body as 20260923003700_expose_chunk_content_hash.sql.
+
+commit;
+```
+
+Then:
+
+```
+ollama pull nomic-embed-text
+```
+
+```
+AI_CHAT_PROVIDER=groq
+AI_CHAT_MODEL=<a model your key actually has access to — GET /v1/models to check;
+               Groq's free-tier model lineup has changed more than once>
+GROQ_API_KEY=gsk_...
+AI_EMBEDDING_PROVIDER=ollama
+AI_EMBEDDING_MODEL=nomic-embed-text
+AI_EMBEDDING_DIMENSIONS=768
+```
+
+...and update `REQUIRED_EMBEDDING_DIMENSIONS` in `packages/ai/src/config.ts`
+to `768` (step 1 above) before running `pnpm ai:check`.
+
+**Why this isn't the repo's default, and shouldn't be committed as one:**
+`REQUIRED_EMBEDDING_DIMENSIONS` is a single global constant, not a
+per-environment setting — changing it affects every clone of this repo, not
+just one machine. Concretely, doing so breaks three things this project
+already has checked in: `packages/ai/src/config.spec.ts` asserts
+`AI_EMBEDDING_DIMENSIONS != 1536` is rejected (so `pnpm test` starts
+failing); `supabase/tests/match_document_chunks.test.sql` and
+`rls_isolation.test.sql` construct 1536-dimension test vectors (so `pnpm
+db:test` starts failing); and the OpenAI/Together/OpenRouter setup
+snippets earlier in this doc all assume a 1536-dimension model, which is
+also almost certainly what a real deployment (as opposed to local dev)
+will actually use. Treat this recipe as a personal, local-only dev
+environment choice — apply the migration and the `config.ts` edit on your
+own machine, keep both out of your commits, and switch back to a
+1536-dimension provider (OpenAI, Groq+OpenAI, Together, or OpenRouter,
+above) before deploying anywhere another person will use the app.
+
 ## Verifying a provider is wired up correctly
 
 `pnpm ai:check` (`apps/api/src/cli/ai-check.ts`) is the fast, manual check:
