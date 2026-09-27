@@ -3716,3 +3716,43 @@ eventual deployed instance a recruiter would actually use. Documented
 instead as a worked example under `docs/PROVIDERS.md`'s existing
 dimension-migration section, explicit about staying local-only and out
 of commits.
+
+**Follow-up, same entry: this workflow's actual first-ever run found a real
+bug in itself.** D9.13 added `.github/workflows/ci.yml` without ever being
+able to run it (that sandbox had no Docker Hub access), so it went in
+unverified beyond "every RUN step's commands replicated by hand outside
+Docker." Its first real run — triggered by this entry's own commit — failed
+both `Gate 3: apps/api e2e` and `Gate 6: apps/web e2e`. Root cause,
+confirmed by reproducing the same failure locally (see below) rather than
+guessed from the CI failure message alone: both jobs' `postgres` service
+used plain `postgres:16`, which doesn't ship the `pgvector` extension at
+all — and the very first migration (`20260916233538_init.sql`) runs
+`create extension if not exists vector` unconditionally. Every e2e run was
+failing at that line, before a single test file even loaded.
+
+**Verified by elimination, not assumption.** Reproducing the exact CI
+failure locally first required clearing four unrelated, genuinely
+machine-specific gaps on the Apple Silicon Mac used for this: `psql` and
+`pgvector` weren't installed (`brew install postgresql@16`, then building
+`pgvector` from source against that exact `pg_config`, since the plain
+`brew install pgvector` links against Homebrew's default `postgresql`
+formula, not `postgresql@16`); the harness's own auto-downloaded PostgREST
+binary is an x86_64 build with no native Apple Silicon release, and even
+after installing Rosetta 2 it failed to load a hard-coded Intel-Homebrew
+`libpq` path, fixed by using `brew install postgrest`'s native arm64 build
+(the harness checks a stale cached-binary path before `PATH`, so the old
+broken download had to be cleared too); and Playwright's Chromium had never
+been downloaded on this machine (`playwright install chromium`). None of
+these are CI-relevant — GitHub's Linux runners hit none of them — they're
+just what a from-scratch local e2e run needed on this particular machine.
+Once those were out of the way, both e2e suites passed cleanly against the
+exact code on `main` — confirming the app itself has no bug here, and the
+CI failure is entirely the workflow's `postgres:16` → `pgvector/pgvector:pg16`
+fix below.
+
+**The fix**: both `e2e-api` and `e2e-web` jobs' `postgres` service now use
+`pgvector/pgvector:pg16` — the official pgvector-maintained image, a
+drop-in replacement for `postgres:16` (same env vars, same behavior)
+with the extension's files already present, so `create extension` in the
+first migration succeeds instead of failing with "extension \"vector\" is
+not available."

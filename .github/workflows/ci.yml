@@ -71,8 +71,13 @@ jobs:
     # against whatever Postgres it's pointed at — this service container
     # is that Postgres.
     services:
+      # pgvector/pgvector:pg16, not plain postgres:16 — the very first
+      # migration (20260916233538_init.sql) runs `create extension if not
+      # exists vector`, which plain postgres:16 doesn't ship at all. Never
+      # caught before this workflow's first real run (D9.13's sandbox had
+      # no Docker Hub access to test it) — see docs/DECISIONS.md D9.16.
       postgres:
-        image: postgres:16
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -115,8 +120,13 @@ jobs:
     name: "Gate 6: apps/web e2e (real Chromium)"
     runs-on: ubuntu-latest
     services:
+      # pgvector/pgvector:pg16, not plain postgres:16 — the very first
+      # migration (20260916233538_init.sql) runs `create extension if not
+      # exists vector`, which plain postgres:16 doesn't ship at all. Never
+      # caught before this workflow's first real run (D9.13's sandbox had
+      # no Docker Hub access to test it) — see docs/DECISIONS.md D9.16.
       postgres:
-        image: postgres:16
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
